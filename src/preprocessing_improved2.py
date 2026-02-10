@@ -140,7 +140,7 @@ def preprocess_corpus(df, text_column="text"):
 
 
 if __name__ == "__main__":
-    df = pd.read_csv("../data/corpus_als_general_pmc3.csv")
+    df = pd.read_csv("../data/corpus_neurodegenerative_disease.csv")
     df_clean = preprocess_corpus(df)
-    df_clean.to_csv("../data/corpus_als_general_pmc_preprocessed3.csv", index=False)
-    print(f"Cleaned corpus saved in ../data/corpus_als_general_pmc_preprocessed3.csv with {len(df_clean)} articles.")
+    df_clean.to_csv("../data/corpus_neurodegenerative_disease_preprocessed.csv", index=False)
+    print(f"Cleaned corpus saved in ../data/corpus_neurodegenerative_disease_preprocessed.csv with {len(df_clean)} articles.")
