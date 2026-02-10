@@ -225,15 +225,15 @@ def extend_gene_search(gene_symbols):
 
 
 if __name__ == '__main__':
-    destination_path = '../results_als_motor_neuron_disease/'
-    ids_file_path = '../data/ids_als_motor_neuron_disease.txt'
+    destination_path = '../results_als_neuromuscular_disease/'
+    ids_file_path = '../data/ids_als_neuromuscular_disease.txt'
 
     Path(ids_file_path).touch(exist_ok=True)
     Path(destination_path).mkdir(parents=True, exist_ok=True)
 
     
     # loads the general search strings
-    search_strings = list_from_txt('../data/search_strings_motor_neuron_disease.txt')
+    search_strings = list_from_txt('../data/search_strings_neuromuscular_disease.txt')
     papers_counter = 0
 
     

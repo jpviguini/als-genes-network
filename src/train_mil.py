@@ -14,16 +14,18 @@ from sklearn.metrics import roc_auc_score
 from config import VALIDATION_GENES
 
 
+umbrella_term = "neurodegenerative_disease"
+MODEL_NAME = "pubmedbert"
+FEATURES_PATH = f"./features_{MODEL_NAME}_{umbrella_term}/features_ALS_{MODEL_NAME}.pkl"
 
-MODEL_NAME = "scibert"
-FEATURES_PATH = f"./features_NOT_{MODEL_NAME}/features_ALS_1970_2026.pkl"
-
-OUT_DIR = f"./scores_mil_NOT_{MODEL_NAME}/"
+OUT_DIR = f"./scores_MIL_{MODEL_NAME}_{umbrella_term}/"
 CV_METRICS_JSON = os.path.join(OUT_DIR, "cv_metrics.json")
 CV_OOF_GOLD_NPZ = os.path.join(OUT_DIR, "scores_oof_gold_only.npz")
 FINAL_ALLGENES_NPZ = os.path.join(OUT_DIR, "scores_final_allgenes.npz")
 
-#INPUT_DIM = 2305 # this might change if you change the features (768 + 768 + 768 + 1)
+#INPUT_DIM = 2305 # this might change if you change the features (768 + 768 + 768 + 1). 
+    # just comment it the bert_embeddings_features.py if you want to add/remove features
+
 INPUT_DIM = 1536
 HIDDEN_DIM = 256
 ATTENTION_DIM = 128

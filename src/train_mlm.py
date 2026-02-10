@@ -11,9 +11,11 @@ from transformers import (
     LineByLineTextDataset,
 )
 
-BASE_MODEL = "dmis-lab/biobert-large-cased-v1.1"
-OUTPUT_DIR = "./biobert_LARGE_als_adapted_model"
-DATA_FILE = "../data/corpus_als_general_pmc_preprocessed3.csv"
+umbrella_term = "motor_neuron_disease"
+
+BASE_MODEL = "microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext"
+OUTPUT_DIR = f"./pubmedbert_finetuned_{umbrella_term}"
+DATA_FILE = f"../data/corpus_{umbrella_term}_preprocessed.csv"
 EPOCHS = 3
 BATCH_SIZE = 16
 MAX_LEN = 256

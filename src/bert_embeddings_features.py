@@ -19,15 +19,17 @@ MODEL_MAP = {
     "scibert": "allenai/scibert_scivocab_uncased",
 }
 
-SELECTED_MODEL_KEY = "scibert"
-OVERRIDE_MODEL_NAME = f"./{SELECTED_MODEL_KEY}_als_adapted_model"
+umbrella_term = "neurodegenerative_disease"
 
-CORPUS_CSV_PATH = "../data/corpus_als_general_pmc_preprocessed3.csv"
+SELECTED_MODEL_KEY = "pubmedbert"
+OVERRIDE_MODEL_NAME = f"./pubmedbert_finetuned_{umbrella_term}"
+
+CORPUS_CSV_PATH = f"../data/corpus_{umbrella_term}_preprocessed.csv"
 TEXT_COL = "text"
 YEAR_COL = "year"
 START_YEAR = 1970
 END_YEAR = 2026
-GENE_UNIVERSE_CSV_PATH = "../data/genes_extracted_validated_general_pmc3.csv"
+GENE_UNIVERSE_CSV_PATH = f"../data/genes_extracted_{umbrella_term}.csv"
 GENE_COL = "gene"
 TARGET_TERMS = ("als_disease_token",)
 
@@ -37,8 +39,10 @@ USE_LAST4_AVG = True
 USE_AMP_ON_CUDA = True
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-OUTPUT_DIR = f"./features_NOT_{SELECTED_MODEL_KEY}/"
-OUTPUT_FILENAME = f"features_ALS_{START_YEAR}_{END_YEAR}.pkl"
+OUTPUT_DIR = f"./features_{SELECTED_MODEL_KEY}_{umbrella_term}/"
+# OUTPUT_FILENAME = f"features_ALS_{START_YEAR}_{END_YEAR}.pkl"
+OUTPUT_FILENAME = f"features_ALS_{SELECTED_MODEL_KEY}.pkl"
+
 TQDM_MININTERVAL = 0.5
 
 # regex tokenization

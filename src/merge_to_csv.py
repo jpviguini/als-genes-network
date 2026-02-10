@@ -3,8 +3,10 @@ import pandas as pd
 from tqdm import tqdm
 import sys
 
-SOURCE_DIR = '../results_als_general3/'       # file with all .txt articles
-OUTPUT_CSV = '../data/corpus_neurodegenerative_disease.csv'
+umbrella_term = "neuromuscular_disease"
+
+SOURCE_DIR = f'../results_als_{umbrella_term}/'       # file with all .txt articles
+OUTPUT_CSV = f'../data/corpus_{umbrella_term}.csv'
 TEXT_COLUMN = 'text'
 YEAR_COLUMN = 'year'
 

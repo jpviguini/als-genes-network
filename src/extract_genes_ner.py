@@ -8,8 +8,9 @@ from tqdm import tqdm
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1" # forces only CPU execution (skips gpu warnings)
 
+umbrella_term = "neuromuscular_disease"
 
-df = pd.read_csv("../data/corpus_neurodegenerative_disease.csv") # original text (not preprocessed)
+df = pd.read_csv(f"../data/corpus_{umbrella_term}.csv") # original text (not preprocessed)
 texts = df['text'].dropna().tolist()
 print(f"Total of texts to process: {len(texts)}")
 
