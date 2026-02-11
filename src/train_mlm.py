@@ -11,7 +11,7 @@ from transformers import (
     LineByLineTextDataset,
 )
 
-umbrella_term = "motor_neuron_disease"
+umbrella_term = "neuromuscular_disease"
 
 BASE_MODEL = "microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext"
 OUTPUT_DIR = f"./pubmedbert_finetuned_{umbrella_term}"

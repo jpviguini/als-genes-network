@@ -65,7 +65,7 @@ genes = list(valid_genes)
 print(f"Validated genes with MyGene: {len(genes)} / {len(genes_list)}")
 
 
-output_path = "../data/genes_extracted_validated_general_pmc3.csv"
+output_path = f"../data/genes_extracted_{umbrella_term}.csv"
 pd.DataFrame({"gene": genes}).to_csv(output_path, index=False)
 
 print(f"Saved file in: {output_path}")

@@ -19,7 +19,7 @@ MODEL_MAP = {
     "scibert": "allenai/scibert_scivocab_uncased",
 }
 
-umbrella_term = "neurodegenerative_disease"
+umbrella_term = "neuromuscular_disease"
 
 SELECTED_MODEL_KEY = "pubmedbert"
 OVERRIDE_MODEL_NAME = f"./pubmedbert_finetuned_{umbrella_term}"

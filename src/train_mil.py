@@ -1,3 +1,5 @@
+# mudar linha 341 e 447 --> sigmoid(logit)
+
 import os
 import json
 import pickle
@@ -14,11 +16,11 @@ from sklearn.metrics import roc_auc_score
 from config import VALIDATION_GENES
 
 
-umbrella_term = "neurodegenerative_disease"
+umbrella_term = "neuromuscular_disease"
 MODEL_NAME = "pubmedbert"
 FEATURES_PATH = f"./features_{MODEL_NAME}_{umbrella_term}/features_ALS_{MODEL_NAME}.pkl"
 
-OUT_DIR = f"./scores_MIL_{MODEL_NAME}_{umbrella_term}/"
+OUT_DIR = f"./logits_MIL_{MODEL_NAME}_{umbrella_term}/"
 CV_METRICS_JSON = os.path.join(OUT_DIR, "cv_metrics.json")
 CV_OOF_GOLD_NPZ = os.path.join(OUT_DIR, "scores_oof_gold_only.npz")
 FINAL_ALLGENES_NPZ = os.path.join(OUT_DIR, "scores_final_allgenes.npz")
@@ -336,7 +338,8 @@ def main():
                 chunk_size=INFER_CHUNK_SIZE,
                 use_amp=USE_AMP_INFER,
             )
-            scores[g] = sigmoid(logit)
+            #scores[g] = sigmoid(logit)
+            scores[g] = logit
 
         # OOF probs for gold_val
         for g in gold_val:
@@ -440,7 +443,8 @@ def main():
             chunk_size=INFER_CHUNK_SIZE,
             use_amp=USE_AMP_INFER,
         )
-        final_scores.append(sigmoid(logit))
+        # final_scores.append(sigmoid(logit))
+        final_scores.append(logit)
         final_counts.append(len(gene_vectors[g]))
 
     np.savez_compressed(
