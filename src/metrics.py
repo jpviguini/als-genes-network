@@ -2,6 +2,7 @@ import os
 import numpy as np
 import pandas as pd
 from sklearn.metrics import roc_auc_score
+from sklearn.metrics import average_precision_score
 from sklearn.utils import resample 
 from gensim.models import Word2Vec, FastText
 from gensim.models import KeyedVectors
@@ -89,7 +90,7 @@ class GeneModelEvaluator:
             # AUC
             try:
                 if len(np.unique(y_true_boot)) > 1:
-                    auc = roc_auc_score(y_true_boot, y_scores_boot)
+                    auc = average_precision_score(y_true_boot, y_scores_boot)
                     boot_metrics["AUC"].append(auc)
             except:
                 pass
@@ -195,7 +196,7 @@ class GeneModelEvaluator:
         
      
         try:
-            metrics["AUC"] = float(roc_auc_score(y_true_raw, y_scores_raw)) if len(np.unique(y_true_raw)) > 1 else 0.0
+            metrics["AUC"] = float(average_precision_score(y_true_raw, y_scores_raw)) if len(np.unique(y_true_raw)) > 1 else 0.0
         except: metrics["AUC"] = 0.0
 
  
@@ -258,7 +259,7 @@ class GeneModelEvaluator:
         metrics = {"Target_Used": "precomputed_scores", "Target_Found": True, "Top_Genes": ranked_genes}
 
         try:
-            metrics["AUC"] = float(roc_auc_score(y_true_raw, y_scores_raw)) if len(np.unique(y_true_raw)) > 1 else 0.0
+            metrics["AUC"] = float(average_precision_score(y_true_raw, y_scores_raw)) if len(np.unique(y_true_raw)) > 1 else 0.0
         except: metrics["AUC"] = 0.0
 
         gold_positions = np.where(y_true_sorted == 1)[0] + 1
@@ -329,14 +330,18 @@ def load_unified_model(filepath):
 
 
 if __name__ == "__main__":
-    SINGLE_MODEL_PATH = "./scores_mil_COS_bert-base/scores_final_allgenes.npz"
+
+    umbrella_term = "motor_neuron_disease"
+
+    #SINGLE_MODEL_PATH = "./scores_mil_COS_bert-base/scores_final_allgenes.npz"
+    SINGLE_MODEL_PATH = f"./logits_MIL_t_pubmedbert_{umbrella_term}/scores_final_allgenes.npz"
     #SINGLE_MODEL_PATH = "../fasttext_models/model_ALS_v200_a0p0025_n5.model"
     #SINGLE_MODEL_PATH = "./scores_biobert_top0/scores_top0_ALS_1970_2026.npz"
     #SINGLE_MODEL_PATH = "./scores_mil_scibert/scores_final_allgenes.npz"
     
 
     MY_GOLD_GENES = VALIDATION_GENES
-    GENES_CSV_PATH = "../data/genes_extracted_validated_general_pmc3.csv"
+    GENES_CSV_PATH = f"../data/genes_extracted_{umbrella_term}_with_freq.csv"
     GENE_COLUMN_NAME = "gene"
     ALL_CANDIDATE_GENES = None
 

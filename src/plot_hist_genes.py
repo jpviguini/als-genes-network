@@ -1,7 +1,7 @@
 import pandas as pd
 import matplotlib.pyplot as plt
 
-umbrella_term = "motor_neuron_disease"
+umbrella_term = "neuromuscular_disease"
 
 csv_path = f"../data/genes_extracted_{umbrella_term}_with_freq.csv"
 top_n = 100   # quantos genes mostrar
