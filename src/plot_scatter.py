@@ -16,8 +16,8 @@ except ImportError:
 
 # --- CONFIGURAÇÕES ---
 # Caminhos dos modelos
-PATH_ALS = "./scores_MIL_t_pubmedbert_motor_neuron_disease/scores_final_allgenes.npz"
-PATH_NEURODEG = "./scores_MIL_t_pubmedbert_neurodegenerative_disease/scores_final_allgenes.npz"
+PATH_ALS = "./scores_LR_pubmedbert_motor_neuron_disease/scores_final_allgenes.npz"
+PATH_NEURODEG = "./scores_LR_pubmedbert_neurodegenerative_disease/scores_final_allgenes.npz"
 # PATH_NEUROMUSC = "./scores_MIL_t_pubmedbert_neuromuscular_disease/scores_final_allgenes.npz"
 
 OT_JSON = "OT-MONDO_0004976-associated-targets-2_12_2026-v25_12.json"
@@ -116,7 +116,7 @@ def plot_specificity_scatter(df, x_col, y_col, hue_col):
                     arrowprops=dict(arrowstyle='-', color='gray', lw=0.5),
                     expand_points=(1.2, 1.2)) # Força empurrar mais para longe dos pontos
     
-    out_name = f"{DATA_DIR}scatter_{x_col}_vs_{y_col}_by_{hue_col}.png"
+    out_name = f"{DATA_DIR}scatter_{x_col}_vs_{y_col}_by_{hue_col}_LR.png"
     plt.tight_layout()
     plt.savefig(out_name, dpi=300)
     plt.close()

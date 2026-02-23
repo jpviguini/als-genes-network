@@ -1,196 +1,202 @@
 import os
-import json
 import pickle
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
 from tqdm import tqdm
-from sklearn.linear_model import LogisticRegression
-from sklearn.decomposition import PCA
 from sklearn.model_selection import StratifiedShuffleSplit
 from sklearn.metrics import roc_auc_score
-from sklearn.preprocessing import StandardScaler
 
-# --- CONFIGURAÇÕES ---
-UMBRELLA_TERM = "motor_neuron_disease"
+from config import VALIDATION_GENES
+
+
+# =========================
+# CONFIG
+# =========================
+umbrella_term = "neurodegenerative_disease"
 MODEL_NAME = "pubmedbert"
 
-# Caminhos (Ajuste se necessário)
-FEATURES_PATH = f"./features_{MODEL_NAME}_{UMBRELLA_TERM}/features_ALS_{MODEL_NAME}.pkl"
-OT_JSON = "OT-MONDO_0004976-associated-targets-2_12_2026-v25_12.json"
-DATA_DIR = "../data/"
+FEATURES_PATH = f"./features_{MODEL_NAME}_{umbrella_term}/features_ALS_{MODEL_NAME}.pkl"
+OUT_DIR = f"./dimensionality_analysis_{MODEL_NAME}_{umbrella_term}/"
 
-# A fonte independente que o supervisor pediu
-TARGET_SOURCE = "eva" 
-THRESHOLD = 0.5
+ORIGINAL_INPUT_DIM = 1536
 
-# Passos de dimensionalidade para testar
-# O input original é 1536 (768 gene + 768 disease). Vamos reduzindo pela metade.
-DIMENSIONS_TO_TEST = [1536, 1024, 512, 256, 128, 64, 32, 16]
+# começa em 1536 e vai dividindo por 2 até 8
+DIMENSIONS_TO_TEST = []
+d = ORIGINAL_INPUT_DIM
+while d >= 8:
+    DIMENSIONS_TO_TEST.append(d)
+    d //= 2
 
-# Configuração da Validação (Bootstrap/Monte Carlo)
-N_SPLITS = 50   # Quantas vezes vamos repetir o teste por dimensão
-TEST_SIZE = 0.2 # 20% dos genes "escondidos" (witheld set)
+# Experimento
+N_SPLITS = 10
+TEST_SIZE = 0.2
+EPOCHS = 30
+LR = 1e-3
+WEIGHT_DECAY = 1e-3
 SEED = 42
 
-def load_ot_target(json_path: str, target_source: str) -> pd.DataFrame:
-    """Carrega o JSON do OpenTargets e extrai o gabarito da source EVA"""
-    print(f"[Info] Carregando Ground Truth de {target_source}...")
-    with open(json_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    df = pd.DataFrame(data)
-    df["gene"] = df["symbol"].astype(str).str.strip().str.upper()
-    
-    if target_source in df.columns:
-        df = df[["gene", target_source]].copy()
-        df[target_source] = pd.to_numeric(df[target_source], errors="coerce").fillna(0)
-        # Binariza: 1 se score >= 0.5, senão 0
-        df["target"] = (df[target_source] >= THRESHOLD).astype(int)
-    else:
-        raise ValueError(f"Source '{target_source}' não encontrada no JSON.")
-        
-    return df[["gene", "target"]].groupby("gene", as_index=False).max()
 
-def prepare_data(features_path: str, df_truth: pd.DataFrame):
+# =========================
+# MODEL
+# =========================
+class BottleneckLogistic(nn.Module):
+    def __init__(self, input_dim: int, target_dim: int):
+        super().__init__()
+
+        if target_dim < input_dim:
+            self.bottleneck = nn.Linear(input_dim, target_dim, bias=False)
+            self.classifier = nn.Linear(target_dim, 1)
+        else:
+            self.bottleneck = nn.Identity()
+            self.classifier = nn.Linear(input_dim, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        z = self.bottleneck(x)
+        logit = self.classifier(z).view(-1)
+        return logit
+
+
+# =========================
+# UTILS
+# =========================
+def set_seed(seed: int):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def prepare_data(features_path: str):
     """
-    1. Carrega os vetores (Bags)
-    2. Faz 'Mean Pooling' (Média dos vetores) para ter 1 vetor por gene
-    3. Cruza com o gabarito (y)
+    Carrega pickle (dict: gene -> list[vectors 1536]) e aplica mean pooling
+    para virar 1 vetor por gene.
     """
-    print("[Info] Carregando features extraídas...")
+    print(f"[info] Loading features: {features_path}")
     with open(features_path, "rb") as f:
-        gene_bags = pickle.load(f)
-    
-    X_list = []
-    y_list = []
-    genes_list = []
-    
-    # Dicionário rápido para lookup do target
-    truth_dict = dict(zip(df_truth["gene"], df_truth["target"]))
-    
-    for gene, vectors in gene_bags.items():
-        if len(vectors) == 0:
-            continue
-            
-        # Passo Crucial: Como o supervisor pediu "Logistic Model", 
-        # precisamos de 1 vetor fixo por gene.
-        # Tiramos a média dos vetores da bag (Mean Pooling).
-        # Isso simula o embedding "final" do gene.
-        mean_vector = np.mean(np.stack(vectors), axis=0)
-        
-        # Define o label (1 se está no EVA, 0 caso contrário/desconhecido)
-        label = truth_dict.get(gene, 0)
-        
-        X_list.append(mean_vector)
+        gene_vectors = pickle.load(f)
+
+    gold_genes = set([str(g).strip().upper() for g in VALIDATION_GENES])
+
+    # positivos
+    pos_genes = [g for g in gene_vectors if g in gold_genes and len(gene_vectors[g]) > 0]
+
+    # negativos
+    neg_genes_all = [g for g in gene_vectors if g not in gold_genes and len(gene_vectors[g]) > 0]
+
+    # 4x negativos
+    np.random.seed(SEED)
+    neg_sample_size = min(len(neg_genes_all), len(pos_genes) * 4)
+    neg_genes = np.random.choice(neg_genes_all, size=neg_sample_size, replace=False)
+
+    final_genes = pos_genes + list(neg_genes)
+
+    X_list, y_list = [], []
+
+    for gene in final_genes:
+        vecs = gene_vectors[gene]  # list[np.array(1536)]
+        mean_vec = np.mean(np.stack(vecs), axis=0)
+
+        label = 1.0 if gene in gold_genes else 0.0
+        X_list.append(mean_vec)
         y_list.append(label)
-        genes_list.append(gene)
-        
-    return np.array(X_list), np.array(y_list), genes_list
 
-def evaluate_dimensionality(X, y, dims):
-    """
-    Loop principal sugerido pelo supervisor:
-    1. Reduz dimensão (PCA)
-    2. Repete N vezes (Split -> Train LR -> Test AUC)
-    """
+    X = np.array(X_list, dtype=np.float32)
+    y = np.array(y_list, dtype=np.float32)
+
+    return X, y
+
+
+def train_eval_loop(X, y, target_dim, device):
+    cv = StratifiedShuffleSplit(n_splits=N_SPLITS, test_size=TEST_SIZE, random_state=SEED)
+    aucs = []
+
+    for train_idx, test_idx in cv.split(X, y):
+        X_train, X_test = X[train_idx], X[test_idx]
+        y_train, y_test = y[train_idx], y[test_idx]
+
+        t_X_train = torch.tensor(X_train, device=device)
+        t_y_train = torch.tensor(y_train, device=device)
+        t_X_test = torch.tensor(X_test, device=device)
+
+        model = BottleneckLogistic(ORIGINAL_INPUT_DIM, target_dim).to(device)
+
+        optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+        criterion = nn.BCEWithLogitsLoss()
+
+        # treino
+        model.train()
+        for _ in range(EPOCHS):
+            optimizer.zero_grad()
+            logits = model(t_X_train)
+            loss = criterion(logits, t_y_train)
+            loss.backward()
+            optimizer.step()
+
+        # avaliação
+        model.eval()
+        with torch.no_grad():
+            test_logits = model(t_X_test)
+            test_probs = torch.sigmoid(test_logits).detach().cpu().numpy()
+
+        try:
+            auc = roc_auc_score(y_test, test_probs)
+            aucs.append(auc)
+        except ValueError:
+            # acontece se y_test tiver só 0 ou só 1 no split
+            pass
+
+    if len(aucs) == 0:
+        return float("nan"), float("nan")
+
+    return float(np.mean(aucs)), float(np.std(aucs))
+
+
+# =========================
+# MAIN
+# =========================
+def main():
+    set_seed(SEED)
+
+    if not os.path.exists(FEATURES_PATH):
+        raise FileNotFoundError(f"Features not found: {FEATURES_PATH}")
+
+    os.makedirs(OUT_DIR, exist_ok=True)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[info] Device: {device}")
+
+    X, y = prepare_data(FEATURES_PATH)
+    print(f"[info] X shape: {X.shape} | y shape: {y.shape}")
+    print(f"[info] Testing dimensions: {DIMENSIONS_TO_TEST}")
+
     results = []
-    
-    # Normaliza antes do PCA (Boa prática)
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-    
-    total_features = X.shape[1]
-    
-    print(f"\n[Info] Iniciando análise de complexidade.")
-    print(f"Total Genes: {X.shape[0]} | Positivos ({TARGET_SOURCE}): {sum(y)}")
-    
-    for dim in tqdm(dims, desc="Testando Dimensionalidades"):
-        current_X = X_scaled
-        
-        # 1. Redução de Dimensionalidade (Steps of two-folds)
-        if dim < total_features:
-            pca = PCA(n_components=dim, random_state=SEED)
-            current_X = pca.fit_transform(X_scaled)
-        
-        # 2. Validação Robusta (Repeated Sub-sampling)
-        cv = StratifiedShuffleSplit(n_splits=N_SPLITS, test_size=TEST_SIZE, random_state=SEED)
-        
-        dim_aucs = []
-        
-        for train_idx, test_idx in cv.split(current_X, y):
-            X_train, X_test = current_X[train_idx], current_X[test_idx]
-            y_train, y_test = y[train_idx], y[test_idx]
-            
-            # 3. Treina Logistic Model (Rápido e Elegante)
-            # class_weight='balanced' ajuda pois temos poucos positivos
-            clf = LogisticRegression(solver='liblinear', class_weight='balanced', max_iter=1000)
-            clf.fit(X_train, y_train)
-            
-            # 4. Computa AUC no conjunto "Withheld" (Teste)
-            y_probs = clf.predict_proba(X_test)[:, 1]
-            
-            try:
-                score = roc_auc_score(y_test, y_probs)
-                dim_aucs.append(score)
-            except ValueError:
-                pass # Ignora fold se der erro (ex: só uma classe no teste)
-        
-        # Salva a média e desvio padrão para essa dimensão
-        mean_auc = np.mean(dim_aucs)
-        std_auc = np.std(dim_aucs)
-        
-        results.append({
-            "dimension": dim,
-            "mean_auc": mean_auc,
-            "std_auc": std_auc
-        })
-        
-    return pd.DataFrame(results)
 
-def plot_complexity_curve(df_results):
-    plt.figure(figsize=(10, 6))
-    
-    # Plot linha com erro sombreado
-    plt.plot(df_results["dimension"], df_results["mean_auc"], marker='o', color='navy', label='Mean AUC')
-    plt.fill_between(
-        df_results["dimension"], 
-        df_results["mean_auc"] - df_results["std_auc"], 
-        df_results["mean_auc"] + df_results["std_auc"], 
-        color='navy', alpha=0.2, label='Std Dev'
-    )
-    
-    plt.xscale('log') # Escala logarítmica fica melhor para potências de 2
-    plt.xlabel('Model Dimensionality (Log Scale)', fontsize=12)
-    plt.ylabel(f'ROC-AUC on {TARGET_SOURCE} (Independent Set)', fontsize=12)
-    plt.title(f'Model Complexity vs. Performance\nTarget: {TARGET_SOURCE}', fontsize=14)
-    plt.grid(True, which="both", ls="--", alpha=0.5)
-    
-    # Anotação de Dimensões
-    for i, row in df_results.iterrows():
-        plt.annotate(f"{int(row['dimension'])}", 
-                     (row['dimension'], row['mean_auc']),
-                     textcoords="offset points", xytext=(0,10), ha='center')
+    print("\n=== DIMENSIONALITY LOOP ===")
+    for dim in tqdm(DIMENSIONS_TO_TEST, desc="Testing dims"):
+        mean_auc, std_auc = train_eval_loop(X, y, dim, device)
 
-    plt.legend()
-    plt.tight_layout()
-    output_file = f"{DATA_DIR}complexity_analysis_{TARGET_SOURCE}.png"
-    plt.savefig(output_file, dpi=300)
-    print(f"\n[Info] Gráfico salvo em: {output_file}")
-    plt.show()
+        print(f"Dim: {dim:4d} | AUC: {mean_auc:.4f} +/- {std_auc:.4f}")
+        results.append(
+            {
+                "dim": dim,
+                "auc_mean": mean_auc,
+                "auc_std": std_auc,
+                "n_splits": N_SPLITS,
+                "test_size": TEST_SIZE,
+                "epochs": EPOCHS,
+            }
+        )
+
+    df = pd.DataFrame(results)
+    out_csv = os.path.join(OUT_DIR, "dimensionality_results.csv")
+    df.to_csv(out_csv, index=False)
+
+    print(f"\n[info] Saved results: {out_csv}")
+
 
 if __name__ == "__main__":
-    # 1. Carregar Gabarito
-    df_truth = load_ot_target(OT_JSON, TARGET_SOURCE)
-    
-    # 2. Carregar e Preparar Dados (Mean Pooling)
-    X, y, _ = prepare_data(FEATURES_PATH, df_truth)
-    
-    # 3. Rodar Loop de Dimensionalidade
-    df_results = evaluate_dimensionality(X, y, DIMENSIONS_TO_TEST)
-    
-    # 4. Mostrar Tabela e Plotar
-    print("\n=== Resultados da Análise de Complexidade ===")
-    print(df_results.sort_values("dimension", ascending=False).to_string(index=False))
-    
-    plot_complexity_curve(df_results)
+    main()

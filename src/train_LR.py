@@ -47,8 +47,7 @@ USE_AMP_INFER = True
 
 SEED = 42
 
-
-# --- NOVO MODELO: REGRESSÃO LOGÍSTICA (MIL via Mean Pooling) ---
+-
 class LogisticRegressionMIL(nn.Module):
     def __init__(self, input_dim: int):
         super().__init__()

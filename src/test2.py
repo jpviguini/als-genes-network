@@ -9,9 +9,9 @@ from sklearn.metrics import roc_auc_score, average_precision_score
 from config import VALIDATION_GENES
 
 OT_JSON = "OT-MONDO_0004976-associated-targets-2_12_2026-v25_12.json"
-UMBRELLA_TERM = "neuromuscular_disease"
+UMBRELLA_TERM = "neurodegenerative_disease"
 GENE_UNIVERSE_CSV = f"../data/genes_extracted_{UMBRELLA_TERM}_with_freq.csv"
-MIL_NPZ = f"./scores_MIL_t_pubmedbert_{UMBRELLA_TERM}/scores_final_allgenes.npz"
+MIL_NPZ = f"./1:4_scores_LR_pubmedbert_{UMBRELLA_TERM}/scores_final_allgenes.npz"
 DATA_DIR = "../data/"
 
 THRESHOLD = 0.5
@@ -54,7 +54,7 @@ def plot_auc_comparison(results_list, metric_name, filename):
     plt.grid(axis='y', linestyle='--', alpha=0.6)
     plt.legend(loc='lower right')
     plt.tight_layout()
-    plt.savefig(f"{DATA_DIR}{filename}.png", dpi=300)
+    plt.savefig(f"{DATA_DIR}_1:4_{filename}.png", dpi=300)
     plt.close()
 
 def plot_top_genes_heatmap(df_eval, top_n=50):
@@ -136,20 +136,30 @@ if __name__ == "__main__":
     # 4. Gerar Gráficos e Resumos
     if all_metrics:
         # Salva gráficos
-        plot_auc_comparison(all_metrics, "pr_auc", f"PR_AUC_holdout_validation_{UMBRELLA_TERM}")
-        plot_auc_comparison(all_metrics, "roc_auc", f"ROC_AUC_holdout_validation_{UMBRELLA_TERM}")
+        plot_auc_comparison(all_metrics, "pr_auc", f"PR_AUC_holdout_validation_{UMBRELLA_TERM}_LR")
+        plot_auc_comparison(all_metrics, "roc_auc", f"ROC_AUC_holdout_validation_{UMBRELLA_TERM}_LR")
         print("\n[info] Gráficos de barra (Hold-out) salvos.")
 
         # Resumo Tabela
         res_df = pd.DataFrame(all_metrics)
-        summary = res_df.pivot(index="gt_source", columns="predictor", values="pr_auc")
-        print("\n=== Average Precision (PR-AUC) - GENERALIZATION TASK ===")
+        summary = res_df.pivot(index="gt_source", columns="predictor", values="roc_auc")
+        print("\n=== (ROC-AUC) - GENERALIZATION TASK ===")
         print(summary)
         
         # Salva CSV com métricas brutas
         res_df.to_csv(f"{DATA_DIR}metrics_holdout_{UMBRELLA_TERM}.csv", index=False)
     else:
         print("\n[Aviso] Nenhuma métrica foi calculada. Verifique se sobraram positivos após a filtragem.")
+
+
+    print("\n=== Quantidade de Gold Genes por Evidence Stream ===")
+    for gt_src in GT_SOURCES:
+        if gt_src not in df_eval.columns:
+            print(f"{gt_src}: não encontrada")
+            continue
+        n_gold = (df_eval[gt_src] >= THRESHOLD).sum()
+        print(f"{gt_src}: {n_gold} gold genes")
+
 
     # 5. Gerar Heatmap (apenas dos genes de teste)
     plot_top_genes_heatmap(df_eval, top_n=50)
