@@ -1,0 +1,51 @@
+# --- data ---
+*.csv
+data/*.csv
+data/corpus/
+data/metrics_csv/
+data/general_plots/
+data/9606.protein.*
+results_*/
+src/features/
+src/scores/
+src/finetuned_models/
+
+# --- common model formats ---
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.model
+
+# --- python junk ---
+__pycache__/
+*.pyc
+
+# --- misc ---
+.DS_Store
+
+# large / generated
+data/corpus/
+data/general_plots/
+data/metrics_csv/
+results_*/
+src/features/
+src/scores/
+src/finetuned_models/
+
+# external / static dumps (muito comum ter milhares de arquivos)
+src/external/
+src/static/
+
+# models
+*.pt
+*.pth
+*.ckpt
+*.bin
+
+# csv
+*.csv
+
+# caches
+__pycache__/
+*.pyc
