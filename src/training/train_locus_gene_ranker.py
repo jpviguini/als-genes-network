@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""Proof-of-concept global locus-to-gene ranking with LOLO CV."""
+"""Proof-of-concept global locus-to-gene ranking with leakage-aware CV ablations.
+
+Core idea:
+- Train one global linear model on (locus, gene) rows.
+- At evaluation time, rank genes within each locus using predicted scores.
+
+Leakage context:
+- LOLO prevents locus leakage, but repeated genes across loci can still appear in
+  both train and test. Embeddings can exploit that as gene-identity shortcut.
+- This script adds CV modes that explicitly audit and prevent gene overlap.
+"""
 
 from __future__ import annotations
 
@@ -7,13 +17,14 @@ import argparse
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 import pandas as pd
 from sklearn.decomposition import PCA
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import average_precision_score, roc_auc_score
+from sklearn.model_selection import GroupKFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
@@ -28,8 +39,10 @@ DEFAULT_OUT_DIR = Path(
 
 LOCUS_COL = "gwas_study_locus_id"
 LABEL_COL = "label_positive"
+GENE_ID_COL = "gene_id"
+GENE_SYMBOL_COL = "gene_symbol"
 
-# Small interpretable genetic baseline requested by user.
+# Small interpretable genetic baseline.
 BASELINE_GENETIC_FEATURES = [
     "variant_inside_gene",
     "dist_variant_to_gene_kb",
@@ -47,8 +60,8 @@ EMBEDDING_INDICATOR_FEATURE = "has_gene_embedding"
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Train a global locus-to-gene ranker with Leave-One-Locus-Out CV "
-            "and export locus-level ranking outputs."
+            "Train a global locus-to-gene ranker and run leakage-aware validation "
+            "ablations across cv_mode x embedding_mode."
         )
     )
     parser.add_argument(
@@ -67,7 +80,25 @@ def parse_args() -> argparse.Namespace:
         "--embedding-mode",
         choices=["none", "full", "pca", "all"],
         default="all",
-        help="Embedding mode to run. Use 'all' for ablation (none/full/pca).",
+        help="Embedding mode to run. Use 'all' for none/full/pca.",
+    )
+    parser.add_argument(
+        "--cv-mode",
+        choices=["lolo", "gene_grouped", "lolo_gene_exclusion", "all"],
+        default="all",
+        help=(
+            "Validation mode: "
+            "'lolo' (standard LOLO), "
+            "'gene_grouped' (GroupKFold by gene_id), "
+            "'lolo_gene_exclusion' (LOLO + remove train rows with test genes), "
+            "'all' (run all three)."
+        ),
+    )
+    parser.add_argument(
+        "--gene-grouped-n-splits",
+        type=int,
+        default=5,
+        help="Target folds for gene_grouped mode (capped by number of unique genes).",
     )
     parser.add_argument(
         "--pca-dim",
@@ -77,9 +108,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--penalty",
-        choices=["l1", "elasticnet"],
+        choices=["none", "l1", "elasticnet"],
         default="l1",
-        help="Logistic regression penalty.",
+        help="Logistic regression penalty. Use 'none' for no regularization.",
     )
     parser.add_argument(
         "--regularization-strength",
@@ -213,7 +244,15 @@ def format_top_contributions(
 
 
 def build_model(penalty: str, c_value: float, l1_ratio: float, max_iter: int, random_state: int) -> Pipeline:
-    if penalty == "l1":
+    if penalty == "none":
+        clf = LogisticRegression(
+            penalty=None,
+            solver="lbfgs",
+            class_weight="balanced",
+            max_iter=int(max_iter),
+            random_state=int(random_state),
+        )
+    elif penalty == "l1":
         clf = LogisticRegression(
             penalty="l1",
             solver="saga",
@@ -268,7 +307,6 @@ class ModeFeatureBuilder:
             self.pca_explained_variance_ratio_ = None
             return np.column_stack([x_base, x_emb])
 
-        # PCA mode
         n_components = min(int(self.pca_dim), x_emb.shape[1], x_emb.shape[0])
         if n_components < 1:
             raise ValueError(
@@ -303,20 +341,26 @@ class ModeFeatureBuilder:
         return np.column_stack([x_base, x_emb_pca])
 
 
-def rank_within_locus(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    out["rank_within_locus"] = (
-        out.groupby(LOCUS_COL)["predicted_score"]
-        .rank(method="first", ascending=False)
-        .astype(int)
-    )
-    return out
+@dataclass
+class FoldSpec:
+    fold_index: int
+    fold_id: str
+    train_idx: np.ndarray
+    test_idx: np.ndarray
+    n_rows_removed_due_to_gene_exclusion: int = 0
+    n_unique_genes_removed_due_to_gene_exclusion: int = 0
 
 
 def resolve_modes(embedding_mode: str) -> List[str]:
     if embedding_mode == "all":
         return ["none", "full", "pca"]
     return [embedding_mode]
+
+
+def resolve_cv_modes(cv_mode: str) -> List[str]:
+    if cv_mode == "all":
+        return ["lolo", "gene_grouped", "lolo_gene_exclusion"]
+    return [cv_mode]
 
 
 def baseline_columns_for_mode(mode: str) -> List[str]:
@@ -326,8 +370,18 @@ def baseline_columns_for_mode(mode: str) -> List[str]:
     return cols
 
 
+def make_gene_group_series(df: pd.DataFrame) -> pd.Series:
+    gid = df[GENE_ID_COL].fillna("").astype(str).str.strip()
+    sym = df[GENE_SYMBOL_COL].fillna("").astype(str).str.strip()
+    gene = gid.where(gid != "", sym)
+    missing = gene == ""
+    if missing.any():
+        gene.loc[missing] = [f"__missing_gene_row_{i}" for i in df.index[missing].tolist()]
+    return gene
+
+
 def validate_input(df: pd.DataFrame, modes: Sequence[str], embedding_cols: Sequence[str]) -> None:
-    required_cols = [LOCUS_COL, LABEL_COL, "gene_symbol"]
+    required_cols = [LOCUS_COL, LABEL_COL, GENE_SYMBOL_COL, GENE_ID_COL]
     missing = [c for c in required_cols if c not in df.columns]
     if missing:
         raise ValueError(f"Input table missing required columns: {missing}")
@@ -357,33 +411,164 @@ def validate_input(df: pd.DataFrame, modes: Sequence[str], embedding_cols: Seque
         raise ValueError(f"Column '{LABEL_COL}' must be binary 0/1.")
 
 
-def run_lolo_for_mode(
+def build_lolo_folds(df: pd.DataFrame, gene_series: pd.Series, gene_exclusion: bool) -> List[FoldSpec]:
+    loci = sorted(df[LOCUS_COL].astype(str).unique().tolist())
+    folds: List[FoldSpec] = []
+
+    for fold_idx, heldout_locus in enumerate(loci, start=1):
+        test_mask = df[LOCUS_COL].astype(str) == heldout_locus
+        test_idx = np.where(test_mask.to_numpy())[0]
+        train_idx_full = np.where((~test_mask).to_numpy())[0]
+
+        removed_rows = 0
+        removed_genes = 0
+        if gene_exclusion:
+            test_genes = set(gene_series.iloc[test_idx].astype(str).tolist())
+            train_genes_full = gene_series.iloc[train_idx_full].astype(str)
+            to_remove = train_genes_full.isin(test_genes).to_numpy()
+            removed_rows = int(to_remove.sum())
+            if removed_rows > 0:
+                removed_genes = int(train_genes_full[to_remove].nunique())
+            train_idx = train_idx_full[~to_remove]
+        else:
+            train_idx = train_idx_full
+
+        folds.append(
+            FoldSpec(
+                fold_index=fold_idx,
+                fold_id=heldout_locus,
+                train_idx=train_idx,
+                test_idx=test_idx,
+                n_rows_removed_due_to_gene_exclusion=removed_rows,
+                n_unique_genes_removed_due_to_gene_exclusion=removed_genes,
+            )
+        )
+    return folds
+
+
+def build_gene_grouped_folds(df: pd.DataFrame, gene_series: pd.Series, y: pd.Series, n_splits_target: int) -> List[FoldSpec]:
+    n_unique_genes = int(gene_series.nunique())
+    n_splits = min(max(2, int(n_splits_target)), n_unique_genes)
+    if n_splits < 2:
+        raise ValueError("gene_grouped CV requires at least 2 unique genes.")
+
+    split_iter = None
+    try:
+        from sklearn.model_selection import StratifiedGroupKFold
+
+        splitter = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=42)
+        split_iter = splitter.split(df, y=y, groups=gene_series)
+    except Exception:
+        splitter = GroupKFold(n_splits=n_splits)
+        split_iter = splitter.split(df, y=y, groups=gene_series)
+
+    folds: List[FoldSpec] = []
+    for fold_idx, (train_idx, test_idx) in enumerate(split_iter, start=1):
+        folds.append(
+            FoldSpec(
+                fold_index=fold_idx,
+                fold_id=f"gene_group_fold_{fold_idx:02d}",
+                train_idx=np.asarray(train_idx),
+                test_idx=np.asarray(test_idx),
+            )
+        )
+    return folds
+
+
+def build_cv_folds(df: pd.DataFrame, gene_series: pd.Series, args: argparse.Namespace, cv_mode: str) -> List[FoldSpec]:
+    y = pd.to_numeric(df[LABEL_COL], errors="coerce").fillna(0).astype(int)
+
+    if cv_mode == "lolo":
+        return build_lolo_folds(df=df, gene_series=gene_series, gene_exclusion=False)
+    if cv_mode == "lolo_gene_exclusion":
+        return build_lolo_folds(df=df, gene_series=gene_series, gene_exclusion=True)
+    if cv_mode == "gene_grouped":
+        return build_gene_grouped_folds(
+            df=df,
+            gene_series=gene_series,
+            y=y,
+            n_splits_target=int(args.gene_grouped_n_splits),
+        )
+    raise ValueError(f"Unsupported cv_mode: {cv_mode}")
+
+
+def assign_rank_within_locus(pred_df: pd.DataFrame) -> pd.DataFrame:
+    out = pred_df.copy()
+    out["rank_within_locus"] = (
+        out.groupby(["fold_index", LOCUS_COL])["predicted_score"]
+        .rank(method="first", ascending=False)
+        .astype(int)
+    )
+    return out
+
+
+def run_cv_for_mode(
     df: pd.DataFrame,
+    gene_series: pd.Series,
     mode: str,
+    cv_mode: str,
     baseline_cols: List[str],
     embedding_cols: List[str],
     args: argparse.Namespace,
 ) -> Dict[str, object]:
-    loci = sorted(df[LOCUS_COL].astype(str).unique().tolist())
+    folds = build_cv_folds(df=df, gene_series=gene_series, args=args, cv_mode=cv_mode)
+
     fold_rows: List[Dict[str, object]] = []
     prediction_rows: List[pd.DataFrame] = []
     positive_rank_rows: List[pd.DataFrame] = []
 
-    for fold_idx, heldout_locus in enumerate(loci, start=1):
-        test_mask = df[LOCUS_COL].astype(str) == heldout_locus
-        train_df = df.loc[~test_mask].reset_index(drop=True)
-        test_df = df.loc[test_mask].reset_index(drop=True)
+    for fold in folds:
+        train_df = df.iloc[fold.train_idx].reset_index(drop=True)
+        test_df = df.iloc[fold.test_idx].reset_index(drop=True)
+
+        train_genes = set(gene_series.iloc[fold.train_idx].astype(str).tolist())
+        test_genes = set(gene_series.iloc[fold.test_idx].astype(str).tolist())
+        overlap = train_genes.intersection(test_genes)
+
+        n_unique_genes_train = int(len(train_genes))
+        n_unique_genes_test = int(len(test_genes))
+        n_gene_overlap = int(len(overlap))
+        overlap_fraction = float(n_gene_overlap / n_unique_genes_test) if n_unique_genes_test > 0 else float("nan")
+
         y_train = train_df[LABEL_COL].astype(int).to_numpy()
         y_test = test_df[LABEL_COL].astype(int).to_numpy()
+
+        base_fold_info = {
+            "validation_mode": cv_mode,
+            "embedding_mode": mode,
+            "mode": mode,
+            "cv_mode": cv_mode,
+            "fold_index": int(fold.fold_index),
+            "fold_id": str(fold.fold_id),
+            "heldout_locus_id": str(fold.fold_id),
+            "n_train_rows": int(len(train_df)),
+            "n_test_rows": int(len(test_df)),
+            "n_unique_genes_train": n_unique_genes_train,
+            "n_unique_genes_test": n_unique_genes_test,
+            "n_gene_overlap_train_test": n_gene_overlap,
+            "gene_overlap_fraction": float_or_nan(overlap_fraction),
+            "n_rows_removed_due_to_gene_exclusion": int(fold.n_rows_removed_due_to_gene_exclusion),
+            "n_unique_genes_removed_due_to_gene_exclusion": int(fold.n_unique_genes_removed_due_to_gene_exclusion),
+        }
+
+        if len(train_df) == 0 or len(test_df) == 0:
+            fold_rows.append(
+                {
+                    **base_fold_info,
+                    "roc_auc": float("nan"),
+                    "pr_auc": float("nan"),
+                    "recall_at_1": float("nan"),
+                    "recall_at_3": float("nan"),
+                    "mrr": float("nan"),
+                    "status": "skipped_empty_train_or_test",
+                }
+            )
+            continue
 
         if np.unique(y_train).size < 2:
             fold_rows.append(
                 {
-                    "mode": mode,
-                    "fold_index": fold_idx,
-                    "heldout_locus_id": heldout_locus,
-                    "n_genes_in_locus": int(len(test_df)),
-                    "n_positive_in_locus": int(y_test.sum()),
+                    **base_fold_info,
                     "roc_auc": float("nan"),
                     "pr_auc": float("nan"),
                     "recall_at_1": float("nan"),
@@ -416,13 +601,16 @@ def run_lolo_for_mode(
         y_score = model.predict_proba(x_test)[:, 1]
 
         pred_df = test_df.copy()
+        pred_df["validation_mode"] = cv_mode
+        pred_df["embedding_mode"] = mode
         pred_df["mode"] = mode
-        pred_df["fold_index"] = fold_idx
-        pred_df["heldout_locus_id"] = heldout_locus
+        pred_df["cv_mode"] = cv_mode
+        pred_df["fold_index"] = int(fold.fold_index)
+        pred_df["fold_id"] = str(fold.fold_id)
+        pred_df["heldout_locus_id"] = str(fold.fold_id)
         pred_df["predicted_score"] = y_score
-        pred_df = rank_within_locus(pred_df)
+        pred_df = assign_rank_within_locus(pred_df)
 
-        # Row-level top feature contributions in the held-out locus.
         scaler = model.named_steps["scaler"]
         logreg = model.named_steps["logreg"]
         coef = logreg.coef_.ravel()
@@ -450,12 +638,16 @@ def run_lolo_for_mode(
             positive_rank_rows.append(
                 positive_df[
                     [
+                        "validation_mode",
+                        "embedding_mode",
                         "mode",
+                        "cv_mode",
                         "fold_index",
+                        "fold_id",
                         "heldout_locus_id",
                         LOCUS_COL,
-                        "gene_id",
-                        "gene_symbol",
+                        GENE_ID_COL,
+                        GENE_SYMBOL_COL,
                         LABEL_COL,
                         "predicted_score",
                         "rank_within_locus",
@@ -465,11 +657,7 @@ def run_lolo_for_mode(
 
         fold_rows.append(
             {
-                "mode": mode,
-                "fold_index": fold_idx,
-                "heldout_locus_id": heldout_locus,
-                "n_genes_in_locus": int(len(test_df)),
-                "n_positive_in_locus": int(y_test.sum()),
+                **base_fold_info,
                 "roc_auc": float_or_nan(roc),
                 "pr_auc": float_or_nan(pr),
                 "recall_at_1": float_or_nan(recall_at_1),
@@ -485,11 +673,10 @@ def run_lolo_for_mode(
         all_predictions = pd.DataFrame(columns=df.columns.tolist() + ["predicted_score", "rank_within_locus"])
 
     all_predictions = all_predictions.sort_values(
-        by=[LOCUS_COL, "predicted_score"],
-        ascending=[True, False],
+        by=["fold_index", LOCUS_COL, "predicted_score"],
+        ascending=[True, True, False],
         kind="stable",
     ).reset_index(drop=True)
-    all_predictions = rank_within_locus(all_predictions)
 
     fold_metrics_df = pd.DataFrame(fold_rows)
     positive_ranks_df = (
@@ -497,12 +684,16 @@ def run_lolo_for_mode(
         if positive_rank_rows
         else pd.DataFrame(
             columns=[
+                "validation_mode",
+                "embedding_mode",
                 "mode",
+                "cv_mode",
                 "fold_index",
+                "fold_id",
                 "heldout_locus_id",
                 LOCUS_COL,
-                "gene_id",
-                "gene_symbol",
+                GENE_ID_COL,
+                GENE_SYMBOL_COL,
                 LABEL_COL,
                 "predicted_score",
                 "rank_within_locus",
@@ -517,23 +708,42 @@ def run_lolo_for_mode(
     ].copy()
 
     pooled_roc = safe_roc_auc(
-        all_predictions[LABEL_COL].astype(int).to_numpy(),
-        all_predictions["predicted_score"].to_numpy(),
+        all_predictions[LABEL_COL].astype(int).to_numpy() if not all_predictions.empty else np.array([], dtype=int),
+        all_predictions["predicted_score"].to_numpy() if not all_predictions.empty else np.array([], dtype=float),
     )
     pooled_pr = safe_pr_auc(
-        all_predictions[LABEL_COL].astype(int).to_numpy(),
-        all_predictions["predicted_score"].to_numpy(),
+        all_predictions[LABEL_COL].astype(int).to_numpy() if not all_predictions.empty else np.array([], dtype=int),
+        all_predictions["predicted_score"].to_numpy() if not all_predictions.empty else np.array([], dtype=float),
     )
 
+    if mode == "none":
+        used_embedding_feature_count = 0
+    elif mode == "full":
+        used_embedding_feature_count = int(len(embedding_cols))
+    else:
+        used_embedding_feature_count = int(min(int(args.pca_dim), len(embedding_cols), len(df)))
+
     summary = {
+        "validation_mode": cv_mode,
+        "embedding_mode": mode,
         "mode": mode,
+        "cv_mode": cv_mode,
         "n_rows": int(len(df)),
         "n_loci": int(df[LOCUS_COL].nunique()),
         "n_positive_rows": int(df[LABEL_COL].astype(int).sum()),
-        "n_positive_genes": int(df.loc[df[LABEL_COL].astype(int) == 1, "gene_symbol"].nunique()),
-        "embedding_feature_count": int(len(embedding_cols)),
+        "n_positive_genes": int(df.loc[df[LABEL_COL].astype(int) == 1, GENE_SYMBOL_COL].nunique()),
+        "available_embedding_feature_count": int(len(embedding_cols)),
+        "used_embedding_feature_count": used_embedding_feature_count,
         "folds_total": int(len(fold_metrics_df)),
         "folds_ok": int((fold_metrics_df["status"] == "ok").sum()) if not fold_metrics_df.empty else 0,
+        "mean_n_train_rows": mean_ignore_nan(fold_metrics_df["n_train_rows"].tolist()) if not fold_metrics_df.empty else float("nan"),
+        "mean_n_test_rows": mean_ignore_nan(fold_metrics_df["n_test_rows"].tolist()) if not fold_metrics_df.empty else float("nan"),
+        "mean_n_unique_genes_train": mean_ignore_nan(fold_metrics_df["n_unique_genes_train"].tolist()) if not fold_metrics_df.empty else float("nan"),
+        "mean_n_unique_genes_test": mean_ignore_nan(fold_metrics_df["n_unique_genes_test"].tolist()) if not fold_metrics_df.empty else float("nan"),
+        "mean_n_gene_overlap_train_test": mean_ignore_nan(fold_metrics_df["n_gene_overlap_train_test"].tolist()) if not fold_metrics_df.empty else float("nan"),
+        "mean_gene_overlap_fraction": mean_ignore_nan(fold_metrics_df["gene_overlap_fraction"].tolist()) if not fold_metrics_df.empty else float("nan"),
+        "total_rows_removed_due_to_gene_exclusion": int(fold_metrics_df["n_rows_removed_due_to_gene_exclusion"].sum()) if not fold_metrics_df.empty else 0,
+        "total_unique_genes_removed_due_to_gene_exclusion": int(fold_metrics_df["n_unique_genes_removed_due_to_gene_exclusion"].sum()) if not fold_metrics_df.empty else 0,
         "mean_fold_roc_auc": mean_ignore_nan(fold_metrics_df["roc_auc"].tolist()) if not fold_metrics_df.empty else float("nan"),
         "std_fold_roc_auc": std_ignore_nan(fold_metrics_df["roc_auc"].tolist()) if not fold_metrics_df.empty else float("nan"),
         "mean_fold_pr_auc": mean_ignore_nan(fold_metrics_df["pr_auc"].tolist()) if not fold_metrics_df.empty else float("nan"),
@@ -545,7 +755,6 @@ def run_lolo_for_mode(
         "pooled_pr_auc": float_or_nan(pooled_pr),
     }
 
-    # Fit final model on full data for coefficient export.
     final_feature_builder = ModeFeatureBuilder(
         baseline_cols=baseline_cols,
         embedding_cols=embedding_cols,
@@ -568,7 +777,10 @@ def run_lolo_for_mode(
 
     coef_df = pd.DataFrame(
         {
+            "validation_mode": cv_mode,
+            "embedding_mode": mode,
             "mode": mode,
+            "cv_mode": cv_mode,
             "feature": final_feature_names,
             "coefficient": final_coef,
             "abs_coefficient": np.abs(final_coef),
@@ -592,7 +804,10 @@ def run_lolo_for_mode(
         evr = final_feature_builder.pca_explained_variance_ratio_
         pca_df = pd.DataFrame(
             {
+                "validation_mode": cv_mode,
+                "embedding_mode": mode,
                 "mode": mode,
+                "cv_mode": cv_mode,
                 "component": [f"emb_pca_{i:03d}" for i in range(len(evr))],
                 "explained_variance_ratio": evr,
                 "cumulative_explained_variance_ratio": np.cumsum(evr),
@@ -600,7 +815,15 @@ def run_lolo_for_mode(
         )
     else:
         pca_df = pd.DataFrame(
-            columns=["mode", "component", "explained_variance_ratio", "cumulative_explained_variance_ratio"]
+            columns=[
+                "validation_mode",
+                "embedding_mode",
+                "mode",
+                "cv_mode",
+                "component",
+                "explained_variance_ratio",
+                "cumulative_explained_variance_ratio",
+            ]
         )
 
     return {
@@ -639,38 +862,144 @@ def write_outputs_for_mode(mode_dir: Path, mode_result: Dict[str, object]) -> No
     mode_result["pca_explained_variance"].to_csv(pca_path, index=False)
 
 
+def _fmt_metric(value: float) -> str:
+    if not np.isfinite(value):
+        return "nan"
+    return f"{value:.4f}"
+
+
+def write_gene_leakage_validation_report(summary_df: pd.DataFrame, out_path: Path) -> None:
+    lines: List[str] = []
+    lines.append("# Gene Leakage Validation Report")
+    lines.append("")
+    lines.append("This report summarizes embedding impact under leakage-aware validation modes.")
+    lines.append("")
+
+    for cv_mode in ["lolo", "gene_grouped", "lolo_gene_exclusion"]:
+        sub = summary_df[summary_df["validation_mode"] == cv_mode].copy()
+        if sub.empty:
+            continue
+        order = {"none": 0, "full": 1, "pca": 2}
+        sub = sub.sort_values("embedding_mode", key=lambda s: s.map(order).fillna(999))
+
+        lines.append(f"## Validation Mode: `{cv_mode}`")
+        lines.append("")
+        lines.append("| embedding_mode | PR-AUC | ROC-AUC | Recall@1 | Recall@3 | MRR | overlap_fraction |")
+        lines.append("|---|---:|---:|---:|---:|---:|---:|")
+        for row in sub.itertuples(index=False):
+            lines.append(
+                "| "
+                f"{row.embedding_mode} | {_fmt_metric(row.mean_fold_pr_auc)} | {_fmt_metric(row.mean_fold_roc_auc)} | "
+                f"{_fmt_metric(row.mean_recall_at_1)} | {_fmt_metric(row.mean_recall_at_3)} | {_fmt_metric(row.mean_mrr)} | "
+                f"{_fmt_metric(row.mean_gene_overlap_fraction)} |"
+            )
+        lines.append("")
+
+        m = sub.set_index("embedding_mode")
+        if "none" in m.index and "full" in m.index:
+            d_pr = float(m.loc["full", "mean_fold_pr_auc"] - m.loc["none", "mean_fold_pr_auc"])
+            d_r3 = float(m.loc["full", "mean_recall_at_3"] - m.loc["none", "mean_recall_at_3"])
+            d_mrr = float(m.loc["full", "mean_mrr"] - m.loc["none", "mean_mrr"])
+            lines.append(
+                f"- Embedding effect (`full - none`): PR-AUC={_fmt_metric(d_pr)}, "
+                f"Recall@3={_fmt_metric(d_r3)}, MRR={_fmt_metric(d_mrr)}."
+            )
+        if "none" in m.index and "pca" in m.index:
+            d_pr = float(m.loc["pca", "mean_fold_pr_auc"] - m.loc["none", "mean_fold_pr_auc"])
+            d_r3 = float(m.loc["pca", "mean_recall_at_3"] - m.loc["none", "mean_recall_at_3"])
+            d_mrr = float(m.loc["pca", "mean_mrr"] - m.loc["none", "mean_mrr"])
+            lines.append(
+                f"- PCA effect (`pca - none`): PR-AUC={_fmt_metric(d_pr)}, "
+                f"Recall@3={_fmt_metric(d_r3)}, MRR={_fmt_metric(d_mrr)}."
+            )
+        lines.append("")
+
+    agg = (
+        summary_df.groupby("validation_mode", as_index=False)
+        .agg(
+            mean_gene_overlap_fraction=("mean_gene_overlap_fraction", "mean"),
+            total_rows_removed_due_to_gene_exclusion=("total_rows_removed_due_to_gene_exclusion", "mean"),
+        )
+    )
+    lines.append("## Interpretation")
+    lines.append("")
+    if not agg.empty:
+        tmp = agg.copy()
+        tmp["mean_gene_overlap_fraction"] = pd.to_numeric(tmp["mean_gene_overlap_fraction"], errors="coerce")
+        tmp["total_rows_removed_due_to_gene_exclusion"] = pd.to_numeric(
+            tmp["total_rows_removed_due_to_gene_exclusion"], errors="coerce"
+        )
+        tmp = tmp.sort_values(
+            ["mean_gene_overlap_fraction", "total_rows_removed_due_to_gene_exclusion"],
+            ascending=[True, False],
+            kind="stable",
+        )
+        conservative = tmp.iloc[0]["validation_mode"]
+        lines.append(f"- Most conservative mode by overlap diagnostics: `{conservative}`.")
+    else:
+        lines.append("- Could not determine conservative mode from summary table.")
+
+    lines.append(
+        "- If embedding gains disappear under zero-overlap modes, previous gains likely relied on gene identity leakage."
+    )
+    lines.append(
+        "- If gains persist under zero-overlap modes, embeddings likely capture transferable biological signal."
+    )
+    lines.append("")
+
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+
+
 def main() -> None:
     args = parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     df = load_table(args.input_table).copy()
     modes = resolve_modes(args.embedding_mode)
+    cv_modes = resolve_cv_modes(args.cv_mode)
     embedding_cols = sorted([c for c in df.columns if c.startswith("gene_emb_")])
     validate_input(df, modes=modes, embedding_cols=embedding_cols)
 
-    # Preserve identifiers.
-    for col in [LOCUS_COL, "gene_id", "gene_symbol", "gwas_study_id"]:
+    for col in [LOCUS_COL, GENE_ID_COL, GENE_SYMBOL_COL, "gwas_study_id"]:
         if col in df.columns:
-            df[col] = df[col].astype(str)
-
+            df[col] = df[col].fillna("").astype(str)
     df[LABEL_COL] = pd.to_numeric(df[LABEL_COL], errors="coerce").fillna(0).astype(int)
+    gene_series = make_gene_group_series(df)
 
-    all_mode_summaries: List[Dict[str, object]] = []
+    all_summary_rows: List[Dict[str, object]] = []
 
-    for mode in modes:
-        mode_result = run_lolo_for_mode(
-            df=df,
-            mode=mode,
-            baseline_cols=baseline_columns_for_mode(mode),
-            embedding_cols=embedding_cols,
-            args=args,
-        )
-        write_outputs_for_mode(args.out_dir / f"mode_{mode}", mode_result)
-        all_mode_summaries.append(mode_result["summary"])
+    for cv_mode in cv_modes:
+        cv_dir = args.out_dir / f"cv_{cv_mode}"
+        cv_dir.mkdir(parents=True, exist_ok=True)
 
-    pd.DataFrame(all_mode_summaries).to_csv(args.out_dir / "ablation_summary.csv", index=False)
-    with open(args.out_dir / "ablation_summary.json", "w", encoding="utf-8") as f:
-        json.dump(all_mode_summaries, f, indent=2, ensure_ascii=False)
+        cv_summary_rows: List[Dict[str, object]] = []
+        for mode in modes:
+            mode_result = run_cv_for_mode(
+                df=df,
+                gene_series=gene_series,
+                mode=mode,
+                cv_mode=cv_mode,
+                baseline_cols=baseline_columns_for_mode(mode),
+                embedding_cols=embedding_cols,
+                args=args,
+            )
+            write_outputs_for_mode(cv_dir / f"mode_{mode}", mode_result)
+            cv_summary_rows.append(mode_result["summary"])
+            all_summary_rows.append(mode_result["summary"])
+
+        pd.DataFrame(cv_summary_rows).to_csv(cv_dir / "ablation_summary.csv", index=False)
+        with open(cv_dir / "ablation_summary.json", "w", encoding="utf-8") as f:
+            json.dump(cv_summary_rows, f, indent=2, ensure_ascii=False)
+
+    comparison_df = pd.DataFrame(all_summary_rows)
+    comparison_df.to_csv(args.out_dir / "validation_comparison_summary.csv", index=False)
+    with open(args.out_dir / "validation_comparison_summary.json", "w", encoding="utf-8") as f:
+        json.dump(all_summary_rows, f, indent=2, ensure_ascii=False)
+
+    write_gene_leakage_validation_report(
+        summary_df=comparison_df,
+        out_path=args.out_dir / "gene_leakage_validation_report.md",
+    )
 
 
 if __name__ == "__main__":

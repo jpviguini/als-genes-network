@@ -57,7 +57,13 @@ def parse_args() -> argparse.Namespace:
         "--top-false-positive-n",
         type=int,
         default=15,
-        help="Number of highest-scoring false positives to plot.",
+        help="Maximum number of false positives to plot after within-locus rank filtering.",
+    )
+    parser.add_argument(
+        "--false-positive-rank-threshold",
+        type=int,
+        default=3,
+        help="Keep false positives with rank_within_locus <= K before optional top-N truncation.",
     )
     return parser.parse_args()
 
@@ -286,6 +292,81 @@ def coefficient_plot(coef_df: pd.DataFrame, title: str, filename: str, out_dir: 
     return generated
 
 
+def feature_weight_comparison_plot(
+    coef_none: pd.DataFrame,
+    coef_full: pd.DataFrame,
+    coef_pca: pd.DataFrame,
+    out_dir: Path,
+) -> List[Tuple[str, str]]:
+    """Compare absolute weights for shared non-embedding features across model modes."""
+    generated: List[Tuple[str, str]] = []
+
+    def _prepare(df: pd.DataFrame, mode_name: str) -> pd.DataFrame:
+        dd = df.copy()
+        dd["mode"] = mode_name
+        return dd
+
+    cat = pd.concat(
+        [
+            _prepare(coef_none, "none"),
+            _prepare(coef_full, "full"),
+            _prepare(coef_pca, "pca"),
+        ],
+        axis=0,
+        ignore_index=True,
+    )
+    if cat.empty:
+        return generated
+
+    # Keep only biologically interpretable/shared non-embedding features.
+    allowed_groups = {"baseline", "other"}
+    cat = cat[cat["feature_group"].astype(str).isin(allowed_groups)].copy()
+    if cat.empty:
+        return generated
+
+    cat["abs_coefficient"] = pd.to_numeric(cat["abs_coefficient"], errors="coerce").fillna(0.0)
+    pivot = cat.pivot_table(
+        index="feature",
+        columns="mode",
+        values="abs_coefficient",
+        aggfunc="first",
+        fill_value=0.0,
+    )
+    for col in ["none", "full", "pca"]:
+        if col not in pivot.columns:
+            pivot[col] = 0.0
+
+    # Stable ordering by average weight.
+    pivot["mean_abs"] = pivot[["none", "full", "pca"]].mean(axis=1)
+    pivot = pivot.sort_values("mean_abs", ascending=False, kind="stable").drop(columns=["mean_abs"])
+    if pivot.empty:
+        return generated
+
+    x = np.arange(len(pivot))
+    w = 0.27
+    fig_w = max(8.5, 0.55 * len(pivot))
+    fig, ax = plt.subplots(figsize=(fig_w, 4.8))
+    ax.bar(x - w, pivot["none"].to_numpy(), width=w, label="none", color="#4e79a7")
+    ax.bar(x, pivot["full"].to_numpy(), width=w, label="full", color="#f28e2b")
+    ax.bar(x + w, pivot["pca"].to_numpy(), width=w, label="pca", color="#59a14f")
+    ax.set_xticks(x)
+    ax.set_xticklabels(pivot.index.tolist(), rotation=45, ha="right")
+    ax.set_ylabel("|Coefficient|")
+    ax.set_title("Feature Weight Comparison Across Modes (Shared Features)")
+    ax.grid(axis="y", alpha=0.25)
+    ax.legend()
+
+    out_name = "feature_weight_comparison_shared_features.png"
+    save_figure(fig, out_dir / out_name)
+    generated.append(
+        (
+            out_name,
+            "Grouped bars comparing absolute coefficient weights of shared non-embedding features across none/full/pca modes.",
+        )
+    )
+    return generated
+
+
 def score_distribution_plot(pred_df: pd.DataFrame, title: str, filename: str, out_dir: Path) -> List[Tuple[str, str]]:
     generated: List[Tuple[str, str]] = []
     if pred_df.empty:
@@ -413,40 +494,128 @@ def embedding_coverage_plot(df: pd.DataFrame, out_dir: Path) -> List[Tuple[str, 
     return generated
 
 
-def top_false_positive_plot(df: pd.DataFrame, out_dir: Path, top_n: int) -> List[Tuple[str, str]]:
+def top_false_positive_plot(
+    df: pd.DataFrame,
+    out_dir: Path,
+    top_n: int,
+    rank_threshold: int,
+) -> List[Tuple[str, str]]:
+    """
+    Plot high-priority false positives using *within-locus* ranking.
+
+    Old logic (incorrect for this project):
+    - filter label_positive == 0
+    - sort globally by predicted_score across all loci
+    - keep top N
+    This treats scores as directly comparable across loci and ignores the fact that
+    the model is used for ranking genes *inside each locus*.
+
+    New logic (aligned with interpretation):
+    - filter label_positive == 0
+    - filter rank_within_locus <= K
+    - sort by (rank_within_locus asc, predicted_score desc)
+    - optionally keep top N after this filter
+    This preserves locus-level ranking semantics first, then uses score as tie-breaker.
+    """
     generated: List[Tuple[str, str]] = []
     if df.empty:
         return generated
-    required = ["gene_symbol", "gwas_study_locus_id", "predicted_score", "has_qtl_evidence", "has_gene_embedding", "dist_score_500kb_log", "label_positive"]
+    required = [
+        "gene_symbol",
+        "gwas_study_locus_id",
+        "predicted_score",
+        "rank_within_locus",
+        "has_qtl_evidence",
+        "has_gene_embedding",
+        "dist_score_500kb_log",
+        "label_positive",
+    ]
     missing = [c for c in required if c not in df.columns]
     if missing:
         return generated
 
-    fp = df[df["label_positive"].astype(int) == 0].copy()
-    fp = fp.sort_values("predicted_score", ascending=False, kind="stable").head(top_n).copy()
+    fp = df.copy()
+    fp["label_positive"] = pd.to_numeric(fp["label_positive"], errors="coerce").fillna(0).astype(int)
+    fp["rank_within_locus"] = pd.to_numeric(fp["rank_within_locus"], errors="coerce")
+    fp["predicted_score"] = pd.to_numeric(fp["predicted_score"], errors="coerce")
+    fp["has_qtl_evidence"] = pd.to_numeric(fp["has_qtl_evidence"], errors="coerce").fillna(0).astype(int)
+    fp["has_gene_embedding"] = pd.to_numeric(fp["has_gene_embedding"], errors="coerce").fillna(0).astype(int)
+    fp["dist_score_500kb_log"] = pd.to_numeric(fp["dist_score_500kb_log"], errors="coerce")
+    fp = fp.dropna(subset=["rank_within_locus", "predicted_score"])
+    fp["rank_within_locus"] = fp["rank_within_locus"].astype(int)
+
+    fp = fp.loc[(fp["label_positive"] == 0) & (fp["rank_within_locus"] <= int(rank_threshold))].copy()
+    fp = fp.sort_values(
+        by=["rank_within_locus", "predicted_score"],
+        ascending=[True, False],
+        kind="stable",
+    )
+    if int(top_n) > 0 and len(fp) > int(top_n):
+        fp = fp.head(int(top_n)).copy()
     if fp.empty:
         return generated
-    fp = fp.iloc[::-1]  # for top at top in barh
-    labels = [f"{g} | {l[:8]}" for g, l in zip(fp["gene_symbol"], fp["gwas_study_locus_id"])]
+
+    # Persist exactly the rows used in this figure.
+    csv_name = "top_false_positives_by_locus_rank.csv"
+    csv_cols = [
+        "gene_symbol",
+        "gwas_study_locus_id",
+        "rank_within_locus",
+        "predicted_score",
+        "has_qtl_evidence",
+        "has_gene_embedding",
+        "dist_score_500kb_log",
+        "label_positive",
+    ]
+    fp[csv_cols].to_csv(out_dir / csv_name, index=False)
+
+    # Reverse for barh so highest priority appears on top.
+    fp = fp.iloc[::-1].reset_index(drop=True)
+    labels = [
+        f"{g} | {str(l)[:8]} | r={int(r)}"
+        for g, l, r in zip(fp["gene_symbol"], fp["gwas_study_locus_id"], fp["rank_within_locus"])
+    ]
 
     fig_h = max(4.2, 0.38 * len(fp))
-    fig, ax = plt.subplots(figsize=(10.8, fig_h))
+    fig, ax = plt.subplots(figsize=(12.0, fig_h))
     ax.barh(labels, fp["predicted_score"], color="#f28e2b")
     ax.set_xlabel("Predicted score")
-    ax.set_title(f"Top {len(fp)} High-scoring False Positives")
+    ax.set_title(
+        f"False Positives by Within-Locus Rank (label=0, rank<= {int(rank_threshold)}, shown={len(fp)})"
+    )
     ax.grid(axis="x", alpha=0.25)
     for i, row in enumerate(fp.itertuples(index=False)):
         ax.text(
             row.predicted_score + 0.005,
             i,
-            f"qtl={int(row.has_qtl_evidence)} emb={int(row.has_gene_embedding)} distScore={float(row.dist_score_500kb_log):.3f}",
+            (
+                f"score={float(row.predicted_score):.3f} "
+                f"rank={int(row.rank_within_locus)} "
+                f"qtl={int(row.has_qtl_evidence)} "
+                f"emb={int(row.has_gene_embedding)} "
+                f"distScore={float(row.dist_score_500kb_log):.3f}"
+            ),
             va="center",
             fontsize=8,
         )
 
-    out_name = "top_false_positives.png"
+    out_name = "top_false_positives_by_locus_rank.png"
     save_figure(fig, out_dir / out_name)
-    generated.append((out_name, "Top-scoring false positives with locus/gene and key biological context annotations."))
+    generated.append(
+        (
+            out_name,
+            (
+                "False positives selected by within-locus rank (label=0, rank<=K), "
+                "then ordered by rank asc and score desc; annotations include score/rank/qtl/embedding/distance."
+            ),
+        )
+    )
+    generated.append(
+        (
+            csv_name,
+            "CSV with exactly the rows used in top_false_positives_by_locus_rank.png.",
+        )
+    )
     return generated
 
 
@@ -512,7 +681,7 @@ def write_figure_index(
     lines.append("")
     lines.append(f"Output directory: `{figures_dir}`")
     lines.append("")
-    lines.append("## Generated figures")
+    lines.append("## Generated outputs")
     lines.append("")
     if not generated:
         lines.append("- None")
@@ -605,6 +774,14 @@ def main() -> None:
             out_dir=args.figures_dir,
         )
     )
+    generated.extend(
+        feature_weight_comparison_plot(
+            coef_none=mode_none["coefficients"],
+            coef_full=mode_full["coefficients"],
+            coef_pca=mode_pca["coefficients"],
+            out_dir=args.figures_dir,
+        )
+    )
 
     # 6) Score distributions by model
     generated.extend(
@@ -690,6 +867,7 @@ def main() -> None:
             df=pred_df,
             out_dir=args.figures_dir,
             top_n=int(args.top_false_positive_n),
+            rank_threshold=int(args.false_positive_rank_threshold),
         )
     )
 

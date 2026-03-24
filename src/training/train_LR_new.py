@@ -1,9 +1,12 @@
 import os
+import csv
 import json
 import pickle
+import sys
 import numpy as np
 import matplotlib.pyplot as plt
 from typing import Dict, List, Set, Tuple
+from pathlib import Path
 from tqdm import tqdm
 from sklearn.model_selection import KFold
 from sklearn.metrics import average_precision_score, roc_auc_score
@@ -11,22 +14,32 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
+
+SRC_DIR = Path(__file__).resolve().parents[1]
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
 from config import VALIDATION_GENES
 
 umbrella_term = "neurodegenerative_disease"
+regularization = 'l2'
 MODEL_NAME = "pubmedbert"
-FEATURES_PATH = f"./features_{MODEL_NAME}_{umbrella_term}/features_ALS_{MODEL_NAME}.pkl"
+FEATURES_PATH = f"../features/featuresUPPER_{MODEL_NAME}_{umbrella_term}/features_ALS_{MODEL_NAME}.pkl"
 
-OUT_DIR = f"./1:4_scores_LR_none_{MODEL_NAME}_{umbrella_term}/"
+OUT_DIR = f"../scores/{umbrella_term}UPPER/all_scores_LR_{regularization}_{MODEL_NAME}_{umbrella_term}/"
 CV_METRICS_JSON = os.path.join(OUT_DIR, "cv_metrics.json")
 CV_OOF_GOLD_NPZ = os.path.join(OUT_DIR, "scores_oof_gold_only.npz")
 FINAL_ALLGENES_NPZ = os.path.join(OUT_DIR, "scores_final_allgenes.npz")
 
 N_FOLDS = 5
 SEED = 42
-NEG_RATIO = 4
-RELIABLE_NEG_MAX_BAG = 10
 MAX_INST_TRAIN = 500
+DEFAULT_C = 0.1
+C_SWEEP_VALUES = np.array([1e-3, 3e-3, 1e-2, 3e-2, 1e-1, 3e-1, 1.0, 3.0, 10.0, 30.0, 100.0], dtype=np.float64)
+
+C_SWEEP_JSON = os.path.join(OUT_DIR, "c_sweep_metrics.json")
+C_SWEEP_CSV = os.path.join(OUT_DIR, "c_sweep_metrics.csv")
+C_SWEEP_PLOT = os.path.join(OUT_DIR, "c_sweep_performance_sparsity.png")
 
 def set_seed(seed: int):
     np.random.seed(seed)
@@ -37,26 +50,11 @@ def subsample(vectors: List[np.ndarray], max_inst: int) -> List[np.ndarray]:
     idx = np.random.choice(len(vectors), max_inst, replace=False)
     return [vectors[i] for i in idx]
 
-def get_reliable_negatives(
+def get_all_negatives(
     gene_dict: Dict[str, List[np.ndarray]],
     exclude: Set[str],
-    n_needed: int,
-    max_bag: int = 5,
 ) -> List[str]:
-
-    low = [g for g, v in gene_dict.items() if (g not in exclude and 0 < len(v) < max_bag)]
-
-    if len(low) >= n_needed:
-        return list(np.random.choice(low, size=n_needed, replace=False))
-
-    remaining = [g for g, v in gene_dict.items() if (g not in exclude and g not in set(low) and len(v) > 0)]
-    need = n_needed - len(low)
-    if need > 0:
-        if need >= len(remaining):
-            low.extend(remaining)
-        else:
-            low.extend(list(np.random.choice(remaining, size=need, replace=False)))
-    return low
+    return [g for g, v in gene_dict.items() if g not in exclude and len(v) > 0]
 
 def compute_fold_metrics(ranked_genes: List[str], val_gold: Set[str]) -> Dict[str, float]:
     if len(val_gold) == 0:
@@ -111,7 +109,78 @@ def build_training_data(gene_vectors, pos_genes, neg_genes):
         
     return np.array(X), np.array(y)
 
-def compute_learning_curve(X_train, y_train, X_val, y_val, fold_idx, out_dir, max_subsets=10):
+def build_lr_pipeline(c_value: float, random_state: int):
+    return make_pipeline(
+        StandardScaler(),
+        LogisticRegression(
+            penalty=regularization,
+            solver='liblinear',
+            C=float(c_value),
+            class_weight='balanced',
+            max_iter=1000,
+            random_state=random_state,
+        )
+    )
+
+def count_selected_features(model, tol: float = 1e-12) -> int:
+    coef = model.named_steps["logisticregression"].coef_
+    return int(np.count_nonzero(np.abs(coef) > tol))
+
+def list_mean_std(values: List[float]) -> Tuple[float, float]:
+    arr = np.asarray(values, dtype=np.float64)
+    arr = arr[~np.isnan(arr)]
+    if arr.size == 0:
+        return float("nan"), float("nan")
+    mean = float(np.mean(arr))
+    std = float(np.std(arr, ddof=1)) if arr.size > 1 else 0.0
+    return mean, std
+
+def save_c_sweep_csv(rows: List[Dict[str, float]], out_csv: str):
+    columns = [
+        "C",
+        "pr_auc_mean", "pr_auc_std",
+        "roc_auc_mean", "roc_auc_std",
+        "selected_features_mean", "selected_features_std",
+        "selected_features_pct_mean", "selected_features_pct_std",
+    ]
+    with open(out_csv, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=columns)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+def plot_c_sweep(rows: List[Dict[str, float]], out_png: str, embedding_dim: int):
+    c_vals = np.array([r["C"] for r in rows], dtype=np.float64)
+    pr_mean = np.array([r["pr_auc_mean"] for r in rows], dtype=np.float64)
+    pr_std = np.array([r["pr_auc_std"] for r in rows], dtype=np.float64)
+    roc_mean = np.array([r["roc_auc_mean"] for r in rows], dtype=np.float64)
+    roc_std = np.array([r["roc_auc_std"] for r in rows], dtype=np.float64)
+    sel_mean = np.array([r["selected_features_mean"] for r in rows], dtype=np.float64)
+
+    fig, ax1 = plt.subplots(figsize=(9, 5))
+    ax1.set_xscale("log")
+    ax1.plot(c_vals, pr_mean, marker="o", label="Avg-PR (CV mean)", color="#1f77b4")
+    ax1.plot(c_vals, roc_mean, marker="s", label="ROC-AUC (CV mean)", color="#ff7f0e")
+    ax1.fill_between(c_vals, pr_mean - pr_std, pr_mean + pr_std, color="#1f77b4", alpha=0.15)
+    ax1.fill_between(c_vals, roc_mean - roc_std, roc_mean + roc_std, color="#ff7f0e", alpha=0.15)
+    ax1.set_xlabel("C (inverse regularization strength)")
+    ax1.set_ylabel("Validation performance")
+    ax1.set_ylim(0.0, 1.05)
+    ax1.grid(True, which="both", linestyle="--", alpha=0.4)
+
+    ax2 = ax1.twinx()
+    ax2.plot(c_vals, sel_mean, marker="^", linestyle="-.", color="black", label="Selected variables (non-zero coef)")
+    ax2.set_ylabel(f"Selected variables (max {embedding_dim})")
+
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc="best")
+    ax1.set_title(f"{regularization} Regularization Sweep: Performance vs Selected Variables")
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=300)
+    plt.close(fig)
+
+def compute_learning_curve(X_train, y_train, X_val, y_val, fold_idx, out_dir, c_value: float = DEFAULT_C, max_subsets=10):
     """Computa learning curves usando subsets do treino e salva o gráfico em PNG."""
     train_sizes = np.linspace(0.1, 1.0, max_subsets)
     train_scores, val_scores = [], []
@@ -122,13 +191,7 @@ def compute_learning_curve(X_train, y_train, X_val, y_val, fold_idx, out_dir, ma
         idx = np.random.choice(n_samples, n, replace=False)
         X_sub, y_sub = X_train[idx], y_train[idx]
 
-        model = make_pipeline(
-            StandardScaler(),
-            LogisticRegression(
-                penalty=None, solver='lbfgs', C=0.1,
-                class_weight='balanced', max_iter=1000, random_state=SEED + fold_idx
-            )
-        )
+        model = build_lr_pipeline(c_value=c_value, random_state=SEED + fold_idx)
         model.fit(X_sub, y_sub)
 
         # Métricas
@@ -178,6 +241,7 @@ def main():
 
     gold_oof_probs: Dict[str, float] = {}
     cv_folds: List[Dict[str, float]] = []
+    c_sweep_fold_metrics: List[Dict[str, float]] = []
 
     for fold, (tr_idx, va_idx) in enumerate(kf.split(gold_arr)):
         set_seed(SEED + fold)
@@ -191,26 +255,15 @@ def main():
         
         # 1. Negativos para TREINO
         exclude_train = set(gold_train) | gold_val_set
-        neg_train = get_reliable_negatives(
-            gene_vectors,
-            exclude=exclude_train,
-            n_needed=len(pos_train) * NEG_RATIO,
-            max_bag=RELIABLE_NEG_MAX_BAG,
-        )
+        neg_train = get_all_negatives(gene_vectors, exclude=exclude_train)
 
-        # 2. Negativos separados para VALIDAÇÃO
-        exclude_val = exclude_train | set(neg_train)
-        neg_val = get_reliable_negatives(
-            gene_vectors,
-            exclude=exclude_val,
-            n_needed=len(gold_val) * NEG_RATIO,
-            max_bag=RELIABLE_NEG_MAX_BAG,
-        )
+        # 2. Usa o mesmo conjunto de negativos na validação
+        neg_val = neg_train.copy()
 
         X_train, y_train = build_training_data(gene_vectors, pos_train, neg_train)
         X_val, y_val = build_training_data(gene_vectors, gold_val, neg_val)
 
-        compute_learning_curve(X_train, y_train, X_val, y_val, fold, OUT_DIR)
+        #compute_learning_curve(X_train, y_train, X_val, y_val, fold, OUT_DIR, c_value=DEFAULT_C)
 
         print(f"[fold {fold+1}] pos_train = {len(pos_train)} | neg_train = {len(neg_train)}")
         print(f"[fold {fold+1}] pos_val   = {len(gold_val)} | neg_val   = {len(neg_val)}")
@@ -219,18 +272,8 @@ def main():
         
         
 
-        # PIPELINE: StandardScaler + Regressão Logística l1
-        model = make_pipeline(
-            StandardScaler(),
-            LogisticRegression(
-                penalty=None, 
-                solver='lbfgs', 
-                C=0.1, 
-                class_weight='balanced',
-                max_iter=1000, 
-                random_state=SEED + fold
-            )
-        )
+        # Modelo principal com C padrão (compatível com os artefatos já usados)
+        model = build_lr_pipeline(c_value=DEFAULT_C, random_state=SEED + fold)
         model.fit(X_train, y_train)
 
         print(f"[info] Scoring ALL genes for fold ranking...")
@@ -259,6 +302,37 @@ def main():
         else:
             fold_metrics["auc"] = float("nan")
 
+        # Sweep de C para medir trade-off desempenho vs esparsidade (L1)
+        y_val_pred_default = model.predict_proba(X_val)[:, 1]
+        selected_default = count_selected_features(model)
+        for c_value in C_SWEEP_VALUES:
+            c_value = float(c_value)
+            if np.isclose(c_value, DEFAULT_C):
+                model_c = model
+                y_val_pred = y_val_pred_default
+                selected_features = selected_default
+            else:
+                model_c = build_lr_pipeline(c_value=c_value, random_state=SEED + fold)
+                model_c.fit(X_train, y_train)
+                y_val_pred = model_c.predict_proba(X_val)[:, 1]
+                selected_features = count_selected_features(model_c)
+
+            pr_auc = float(average_precision_score(y_val, y_val_pred))
+            if len(np.unique(y_val)) == 2:
+                roc_auc = float(roc_auc_score(y_val, y_val_pred))
+            else:
+                roc_auc = float("nan")
+
+            c_sweep_fold_metrics.append(
+                {
+                    "C": c_value,
+                    "fold": float(fold + 1),
+                    "pr_auc": pr_auc,
+                    "roc_auc": roc_auc,
+                    "selected_features": float(selected_features),
+                }
+            )
+
         fold_metrics["fold"] = float(fold + 1)
         cv_folds.append(fold_metrics)
         
@@ -286,6 +360,55 @@ def main():
     for k in metrics_keys:
         print(f"  {k:10s}: {summary_fmt[k]}")
 
+    embedding_dim = int(X_all_genes.shape[1])
+    c_sweep_summary: List[Dict[str, float]] = []
+    for c_value in C_SWEEP_VALUES:
+        c_value = float(c_value)
+        rows_c = [r for r in c_sweep_fold_metrics if np.isclose(r["C"], c_value)]
+        pr_mean, pr_std = list_mean_std([r["pr_auc"] for r in rows_c])
+        roc_mean, roc_std = list_mean_std([r["roc_auc"] for r in rows_c])
+        sel_mean, sel_std = list_mean_std([r["selected_features"] for r in rows_c])
+        sel_pct_mean, sel_pct_std = list_mean_std(
+            [(100.0 * r["selected_features"] / embedding_dim) for r in rows_c]
+        )
+        c_sweep_summary.append(
+            {
+                "C": c_value,
+                "pr_auc_mean": pr_mean,
+                "pr_auc_std": pr_std,
+                "roc_auc_mean": roc_mean,
+                "roc_auc_std": roc_std,
+                "selected_features_mean": sel_mean,
+                "selected_features_std": sel_std,
+                "selected_features_pct_mean": sel_pct_mean,
+                "selected_features_pct_std": sel_pct_std,
+            }
+        )
+
+    c_sweep_payload = {
+        "regularization": regularization,
+        "default_c": DEFAULT_C,
+        "embedding_dim": embedding_dim,
+        "n_folds": N_FOLDS,
+        "seed": SEED,
+        "fold_metrics": c_sweep_fold_metrics,
+        "summary": c_sweep_summary,
+    }
+    with open(C_SWEEP_JSON, "w") as f:
+        json.dump(c_sweep_payload, f, indent=2)
+    save_c_sweep_csv(c_sweep_summary, C_SWEEP_CSV)
+    plot_c_sweep(c_sweep_summary, C_SWEEP_PLOT, embedding_dim)
+
+    print(f"\n[info] Saved C sweep JSON to: {C_SWEEP_JSON}")
+    print(f"[info] Saved C sweep CSV to: {C_SWEEP_CSV}")
+    print(f"[info] Saved C sweep plot to: {C_SWEEP_PLOT}")
+    for row in c_sweep_summary:
+        print(
+            f"  C={row['C']:<5g} | PR-AUC={row['pr_auc_mean']:.3f} ± {row['pr_auc_std']:.3f} | "
+            f"ROC-AUC={row['roc_auc_mean']:.3f} ± {row['roc_auc_std']:.3f} | "
+            f"selected={row['selected_features_mean']:.1f}/{embedding_dim} ({row['selected_features_pct_mean']:.1f}%)"
+        )
+
     oof_genes = sorted(gold_oof_probs.keys())
     oof_scores = np.array([gold_oof_probs[g] for g in oof_genes], dtype=np.float32)
     oof_counts = np.array([len(gene_vectors[g]) for g in oof_genes], dtype=np.int32)
@@ -295,33 +418,21 @@ def main():
         genes=np.array(oof_genes, dtype=np.str_),
         scores_topm=oof_scores,
         ctx_counts=oof_counts,
-        meta=np.array([json.dumps({"method": "LogReg_l1_Pipeline", "folds": N_FOLDS, "seed": SEED})], dtype=np.str_),
+        meta=np.array([json.dumps({f"method": "LogReg_{regularization}_Pipeline", "folds": N_FOLDS, "seed": SEED})], dtype=np.str_),
     )
 
     print("\nFINAL MODEL TRAINING (ALL GOLD)")
     set_seed(SEED + 999)
     
     pos_final = [g for g in gold_available if len(gene_vectors[g]) > 0]
-    neg_final = get_reliable_negatives(
+    neg_final = get_all_negatives(
         gene_vectors,
         exclude=set(gold_available),
-        n_needed=len(pos_final) * NEG_RATIO,
-        max_bag=RELIABLE_NEG_MAX_BAG,
     )
 
     X_train_final, y_train_final = build_training_data(gene_vectors, pos_final, neg_final)
     
-    model_final = make_pipeline(
-        StandardScaler(),
-        LogisticRegression(
-            penalty=None, 
-            solver='lbfgs', 
-            C=0.1, 
-            class_weight='balanced',
-            max_iter=1000, 
-            random_state=SEED + 999
-        )
-    )
+    model_final = build_lr_pipeline(c_value=DEFAULT_C, random_state=SEED + 999)
     model_final.fit(X_train_final, y_train_final)
 
     final_probs = model_final.predict_proba(X_all_genes)[:, 1]
@@ -332,7 +443,7 @@ def main():
         genes=np.array(all_genes, dtype=np.str_),
         scores_topm=np.array(final_probs, dtype=np.float32),
         ctx_counts=np.array(final_counts, dtype=np.int32),
-        meta=np.array([json.dumps({"method": "LogReg_l1_Pipeline", "seed": SEED})], dtype=np.str_),
+        meta=np.array([json.dumps({f"method": "LogReg_{regularization}_Pipeline", "seed": SEED})], dtype=np.str_),
     )
     print(f"[info] Saved FINAL all-genes NPZ to: {FINAL_ALLGENES_NPZ}")
 
