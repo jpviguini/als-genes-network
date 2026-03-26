@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
-"""Proof-of-concept global locus-to-gene ranking with leakage-aware CV ablations.
+"""Proof-of-concept global locus-to-gene ranking with strict leakage control.
 
 Core idea:
 - Train one global linear model on (locus, gene) rows.
 - At evaluation time, rank genes within each locus using predicted scores.
 
 Leakage context:
-- LOLO prevents locus leakage, but repeated genes across loci can still appear in
-  both train and test. Embeddings can exploit that as gene-identity shortcut.
-- This script adds CV modes that explicitly audit and prevent gene overlap.
+- This script uses LOLO with gene-exclusion, removing train rows that contain
+  any gene appearing in the held-out test locus.
 """
 
 from __future__ import annotations
@@ -24,7 +23,6 @@ import pandas as pd
 from sklearn.decomposition import PCA
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import average_precision_score, roc_auc_score
-from sklearn.model_selection import GroupKFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
@@ -55,13 +53,72 @@ BASELINE_GENETIC_FEATURES = [
     "tissue_count",
 ]
 EMBEDDING_INDICATOR_FEATURE = "has_gene_embedding"
+DEFAULT_DISTANCE_WINDOW_BP = 500_000
+
+DISTANCE_IMPUTE_SPECS = [
+    ("dist_variant_to_gene_bp", "max"),
+    ("dist_variant_to_gene_kb", "max"),
+    ("dist_variant_to_tss_bp", "max"),
+    ("dist_variant_to_tss_kb", "max"),
+    ("dist_score_500kb_log", "min"),
+]
+
+
+def _estimate_default_window_bp(df: pd.DataFrame) -> int:
+    if all(c in df.columns for c in ["candidate_window_start", "candidate_window_end", "gwas_lead_variant_position"]):
+        ws = pd.to_numeric(df["candidate_window_start"], errors="coerce")
+        we = pd.to_numeric(df["candidate_window_end"], errors="coerce")
+        vp = pd.to_numeric(df["gwas_lead_variant_position"], errors="coerce")
+        left = (vp - ws).abs()
+        right = (we - vp).abs()
+        vals = pd.concat([left, right], axis=0)
+        vals = vals[np.isfinite(vals)]
+        if not vals.empty:
+            return max(int(vals.max()), 0)
+    return int(DEFAULT_DISTANCE_WINDOW_BP)
+
+
+def impute_distance_features_worst_case(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Impute distance missings pessimistically:
+    - Distance columns: fill with max observed distance (or window fallback).
+    - Distance score (higher is better): fill with min observed score (or 0.0).
+    """
+    if df.empty:
+        return df
+
+    out = df.copy()
+    window_bp = _estimate_default_window_bp(out)
+    window_kb = float(window_bp) / 1000.0
+    fallback = {
+        "dist_variant_to_gene_bp": float(window_bp),
+        "dist_variant_to_gene_kb": float(window_kb),
+        "dist_variant_to_tss_bp": float(window_bp),
+        "dist_variant_to_tss_kb": float(window_kb),
+        "dist_score_500kb_log": 0.0,
+    }
+
+    for col, strategy in DISTANCE_IMPUTE_SPECS:
+        if col not in out.columns:
+            continue
+        numeric = pd.to_numeric(out[col], errors="coerce")
+        observed = numeric[np.isfinite(numeric)]
+        if strategy == "max":
+            fill_value = float(observed.max()) if not observed.empty else fallback[col]
+            out[col] = numeric.clip(lower=0).fillna(fill_value)
+        else:
+            fill_value = float(observed.min()) if not observed.empty else fallback[col]
+            fill_value = float(np.clip(fill_value, 0.0, 1.0))
+            out[col] = numeric.clip(lower=0.0, upper=1.0).fillna(fill_value)
+
+    return out
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Train a global locus-to-gene ranker and run leakage-aware validation "
-            "ablations across cv_mode x embedding_mode."
+            "Train a global locus-to-gene ranker with fixed "
+            "lolo_gene_exclusion validation and embedding ablations."
         )
     )
     parser.add_argument(
@@ -84,32 +141,23 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--cv-mode",
-        choices=["lolo", "gene_grouped", "lolo_gene_exclusion", "all"],
-        default="all",
+        choices=["lolo_gene_exclusion"],
+        default="lolo_gene_exclusion",
         help=(
-            "Validation mode: "
-            "'lolo' (standard LOLO), "
-            "'gene_grouped' (GroupKFold by gene_id), "
-            "'lolo_gene_exclusion' (LOLO + remove train rows with test genes), "
-            "'all' (run all three)."
+            "Validation mode: only 'lolo_gene_exclusion' "
+            "(LOLO + remove train rows with held-out genes)."
         ),
-    )
-    parser.add_argument(
-        "--gene-grouped-n-splits",
-        type=int,
-        default=5,
-        help="Target folds for gene_grouped mode (capped by number of unique genes).",
     )
     parser.add_argument(
         "--pca-dim",
         type=int,
-        default=16,
+        default=32,
         help="PCA components for embedding_mode='pca'.",
     )
     parser.add_argument(
         "--penalty",
         choices=["none", "l1", "elasticnet"],
-        default="l1",
+        default="none",
         help="Logistic regression penalty. Use 'none' for no regularization.",
     )
     parser.add_argument(
@@ -358,9 +406,9 @@ def resolve_modes(embedding_mode: str) -> List[str]:
 
 
 def resolve_cv_modes(cv_mode: str) -> List[str]:
-    if cv_mode == "all":
-        return ["lolo", "gene_grouped", "lolo_gene_exclusion"]
-    return [cv_mode]
+    if cv_mode != "lolo_gene_exclusion":
+        raise ValueError("Only cv_mode='lolo_gene_exclusion' is supported.")
+    return ["lolo_gene_exclusion"]
 
 
 def baseline_columns_for_mode(mode: str) -> List[str]:
@@ -411,7 +459,7 @@ def validate_input(df: pd.DataFrame, modes: Sequence[str], embedding_cols: Seque
         raise ValueError(f"Column '{LABEL_COL}' must be binary 0/1.")
 
 
-def build_lolo_folds(df: pd.DataFrame, gene_series: pd.Series, gene_exclusion: bool) -> List[FoldSpec]:
+def build_lolo_gene_exclusion_folds(df: pd.DataFrame, gene_series: pd.Series) -> List[FoldSpec]:
     loci = sorted(df[LOCUS_COL].astype(str).unique().tolist())
     folds: List[FoldSpec] = []
 
@@ -420,18 +468,12 @@ def build_lolo_folds(df: pd.DataFrame, gene_series: pd.Series, gene_exclusion: b
         test_idx = np.where(test_mask.to_numpy())[0]
         train_idx_full = np.where((~test_mask).to_numpy())[0]
 
-        removed_rows = 0
-        removed_genes = 0
-        if gene_exclusion:
-            test_genes = set(gene_series.iloc[test_idx].astype(str).tolist())
-            train_genes_full = gene_series.iloc[train_idx_full].astype(str)
-            to_remove = train_genes_full.isin(test_genes).to_numpy()
-            removed_rows = int(to_remove.sum())
-            if removed_rows > 0:
-                removed_genes = int(train_genes_full[to_remove].nunique())
-            train_idx = train_idx_full[~to_remove]
-        else:
-            train_idx = train_idx_full
+        test_genes = set(gene_series.iloc[test_idx].astype(str).tolist())
+        train_genes_full = gene_series.iloc[train_idx_full].astype(str)
+        to_remove = train_genes_full.isin(test_genes).to_numpy()
+        removed_rows = int(to_remove.sum())
+        removed_genes = int(train_genes_full[to_remove].nunique()) if removed_rows > 0 else 0
+        train_idx = train_idx_full[~to_remove]
 
         folds.append(
             FoldSpec(
@@ -446,49 +488,9 @@ def build_lolo_folds(df: pd.DataFrame, gene_series: pd.Series, gene_exclusion: b
     return folds
 
 
-def build_gene_grouped_folds(df: pd.DataFrame, gene_series: pd.Series, y: pd.Series, n_splits_target: int) -> List[FoldSpec]:
-    n_unique_genes = int(gene_series.nunique())
-    n_splits = min(max(2, int(n_splits_target)), n_unique_genes)
-    if n_splits < 2:
-        raise ValueError("gene_grouped CV requires at least 2 unique genes.")
-
-    split_iter = None
-    try:
-        from sklearn.model_selection import StratifiedGroupKFold
-
-        splitter = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=42)
-        split_iter = splitter.split(df, y=y, groups=gene_series)
-    except Exception:
-        splitter = GroupKFold(n_splits=n_splits)
-        split_iter = splitter.split(df, y=y, groups=gene_series)
-
-    folds: List[FoldSpec] = []
-    for fold_idx, (train_idx, test_idx) in enumerate(split_iter, start=1):
-        folds.append(
-            FoldSpec(
-                fold_index=fold_idx,
-                fold_id=f"gene_group_fold_{fold_idx:02d}",
-                train_idx=np.asarray(train_idx),
-                test_idx=np.asarray(test_idx),
-            )
-        )
-    return folds
-
-
-def build_cv_folds(df: pd.DataFrame, gene_series: pd.Series, args: argparse.Namespace, cv_mode: str) -> List[FoldSpec]:
-    y = pd.to_numeric(df[LABEL_COL], errors="coerce").fillna(0).astype(int)
-
-    if cv_mode == "lolo":
-        return build_lolo_folds(df=df, gene_series=gene_series, gene_exclusion=False)
+def build_cv_folds(df: pd.DataFrame, gene_series: pd.Series, cv_mode: str) -> List[FoldSpec]:
     if cv_mode == "lolo_gene_exclusion":
-        return build_lolo_folds(df=df, gene_series=gene_series, gene_exclusion=True)
-    if cv_mode == "gene_grouped":
-        return build_gene_grouped_folds(
-            df=df,
-            gene_series=gene_series,
-            y=y,
-            n_splits_target=int(args.gene_grouped_n_splits),
-        )
+        return build_lolo_gene_exclusion_folds(df=df, gene_series=gene_series)
     raise ValueError(f"Unsupported cv_mode: {cv_mode}")
 
 
@@ -511,7 +513,7 @@ def run_cv_for_mode(
     embedding_cols: List[str],
     args: argparse.Namespace,
 ) -> Dict[str, object]:
-    folds = build_cv_folds(df=df, gene_series=gene_series, args=args, cv_mode=cv_mode)
+    folds = build_cv_folds(df=df, gene_series=gene_series, cv_mode=cv_mode)
 
     fold_rows: List[Dict[str, object]] = []
     prediction_rows: List[pd.DataFrame] = []
@@ -875,7 +877,7 @@ def write_gene_leakage_validation_report(summary_df: pd.DataFrame, out_path: Pat
     lines.append("This report summarizes embedding impact under leakage-aware validation modes.")
     lines.append("")
 
-    for cv_mode in ["lolo", "gene_grouped", "lolo_gene_exclusion"]:
+    for cv_mode in ["lolo_gene_exclusion"]:
         sub = summary_df[summary_df["validation_mode"] == cv_mode].copy()
         if sub.empty:
             continue
@@ -914,31 +916,9 @@ def write_gene_leakage_validation_report(summary_df: pd.DataFrame, out_path: Pat
             )
         lines.append("")
 
-    agg = (
-        summary_df.groupby("validation_mode", as_index=False)
-        .agg(
-            mean_gene_overlap_fraction=("mean_gene_overlap_fraction", "mean"),
-            total_rows_removed_due_to_gene_exclusion=("total_rows_removed_due_to_gene_exclusion", "mean"),
-        )
-    )
     lines.append("## Interpretation")
     lines.append("")
-    if not agg.empty:
-        tmp = agg.copy()
-        tmp["mean_gene_overlap_fraction"] = pd.to_numeric(tmp["mean_gene_overlap_fraction"], errors="coerce")
-        tmp["total_rows_removed_due_to_gene_exclusion"] = pd.to_numeric(
-            tmp["total_rows_removed_due_to_gene_exclusion"], errors="coerce"
-        )
-        tmp = tmp.sort_values(
-            ["mean_gene_overlap_fraction", "total_rows_removed_due_to_gene_exclusion"],
-            ascending=[True, False],
-            kind="stable",
-        )
-        conservative = tmp.iloc[0]["validation_mode"]
-        lines.append(f"- Most conservative mode by overlap diagnostics: `{conservative}`.")
-    else:
-        lines.append("- Could not determine conservative mode from summary table.")
-
+    lines.append("- Validation mode is fixed to `lolo_gene_exclusion` (zero train/test gene overlap by construction).")
     lines.append(
         "- If embedding gains disappear under zero-overlap modes, previous gains likely relied on gene identity leakage."
     )
@@ -955,6 +935,7 @@ def main() -> None:
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     df = load_table(args.input_table).copy()
+    df = impute_distance_features_worst_case(df)
     modes = resolve_modes(args.embedding_mode)
     cv_modes = resolve_cv_modes(args.cv_mode)
     embedding_cols = sorted([c for c in df.columns if c.startswith("gene_emb_")])

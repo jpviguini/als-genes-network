@@ -80,7 +80,7 @@ class PipelineConfig:
     page_size: int = 200
     timeout_sec: float = 60.0
     max_retries: int = 3
-    embedding_fill_value: float = float("nan")
+    embedding_fill_value: float = 0.0
     write_csv: bool = True
     write_parquet: bool = True
     write_raw_coloc: bool = True
@@ -332,6 +332,44 @@ def dist_score_500kb_log(distance_bp: int, window_bp: int = 500_000, min_bp: int
         return 0.0
     score = 1.0 - ((np.log10(d) - np.log10(min_bp)) / denom)
     return float(np.clip(score, 0.0, 1.0))
+
+
+def impute_distance_features_worst_case(df: pd.DataFrame, window_bp: int) -> pd.DataFrame:
+    """
+    Impute missing distance features with worst-case values.
+
+    Rationale: smaller distances are better, so missing values should not receive
+    optimistic imputations.
+    """
+    if df.empty:
+        return df
+
+    out = df.copy()
+    window_bp = max(int(window_bp), 0)
+    window_kb = float(window_bp) / 1000.0
+    specs = [
+        ("dist_variant_to_gene_bp", "max", float(window_bp)),
+        ("dist_variant_to_gene_kb", "max", float(window_kb)),
+        ("dist_variant_to_tss_bp", "max", float(window_bp)),
+        ("dist_variant_to_tss_kb", "max", float(window_kb)),
+        ("dist_score_500kb_log", "min", 0.0),
+    ]
+
+    for col, strategy, fallback in specs:
+        if col not in out.columns:
+            continue
+        numeric = pd.to_numeric(out[col], errors="coerce")
+        observed = numeric[np.isfinite(numeric)]
+
+        if strategy == "max":
+            fill_value = float(observed.max()) if not observed.empty else float(fallback)
+            out[col] = numeric.clip(lower=0).fillna(fill_value)
+        else:
+            fill_value = float(observed.min()) if not observed.empty else float(fallback)
+            fill_value = float(np.clip(fill_value, 0.0, 1.0))
+            out[col] = numeric.clip(lower=0.0, upper=1.0).fillna(fill_value)
+
+    return out
 
 
 class GraphQLClient:
@@ -861,7 +899,9 @@ def build_candidate_gene_rows(
                 }
             )
 
-    return pd.DataFrame(out_rows), stats
+    out_df = pd.DataFrame(out_rows)
+    out_df = impute_distance_features_worst_case(out_df, window_bp=int(window_bp))
+    return out_df, stats
 
 
 def aggregate_colocalisation_by_gene(
@@ -1032,6 +1072,35 @@ def merge_candidates_with_coloc(
     out["coding_score_sum_pip"] = 0.0
     out["coding_variant_count"] = 0
     out["expression_score"] = 0.0
+
+    out = preprocess_qtl_numeric_features(out)
+
+    return out
+
+
+def preprocess_qtl_numeric_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Fill missing QTL/coloc numeric features with 0 and square values."""
+    out = df.copy()
+    qtl_numeric_cols = [
+        "coloc_record_count",
+        "qtl_study_locus_count",
+        "qtl_study_count",
+        "tissue_count",
+        "n_trans_qtl",
+        "colocalisation_h4_max",
+        "colocalisation_h4_mean",
+        "colocalisation_h3_mean",
+        "colocalisation_clpp_max",
+        "colocalisation_clpp_mean",
+        "coloc_score_raw_h4_max",
+        "coloc_score",
+    ]
+
+    for col in qtl_numeric_cols:
+        if col not in out.columns:
+            continue
+        numeric = pd.to_numeric(out[col], errors="coerce").fillna(0.0)
+        out[col] = np.square(numeric).astype(float)
 
     return out
 
