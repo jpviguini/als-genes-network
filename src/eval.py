@@ -4,17 +4,16 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.metrics import roc_auc_score, average_precision_score
-
-# Importa a lista de genes usados no treino para removê-los da validação
+from training.train_LR_new import regularization
 from config import VALIDATION_GENES
 
-model_name = 'scores_string_LR'
+model_name = f'all_scores_LR_{regularization}'
 
-OT_JSON = "OT-MONDO_0004976-associated-targets-2_12_2026-v25_12.json"
+OT_JSON = "./external/OT-MONDO_0004976-associated-targets-2_12_2026-v25_12.json"
 UMBRELLA_TERM = "neurodegenerative_disease"
 GENE_UNIVERSE_CSV = f"../data/genes_extracted_{UMBRELLA_TERM}_with_freq.csv"
-MIL_NPZ = f"./{model_name}_pubmedbert_{UMBRELLA_TERM}/scores_final_allgenes.npz"
-DATA_DIR = "../data/"
+MIL_NPZ = f"./scores/{UMBRELLA_TERM}/{model_name}_pubmedbert_{UMBRELLA_TERM}/scores_final_allgenes.npz"
+DATA_DIR = "../data/metrics_plots/"
 
 THRESHOLD = 0.5
 

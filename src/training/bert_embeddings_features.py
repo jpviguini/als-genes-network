@@ -19,17 +19,19 @@ MODEL_MAP = {
     "scibert": "allenai/scibert_scivocab_uncased",
 }
 
-umbrella_term = "neuromuscular_disease"
+umbrella_term = "motor_neuron_disease"
 
 SELECTED_MODEL_KEY = "pubmedbert"
 OVERRIDE_MODEL_NAME = f"./pubmedbert_finetuned_{umbrella_term}"
 
-CORPUS_CSV_PATH = f"../data/corpus_{umbrella_term}_preprocessed.csv"
+CORPUS_CSV_PATH = f"../../data/corpus/preprocessed/corpus_{umbrella_term}_preprocessed.csv"
 TEXT_COL = "text"
 YEAR_COL = "year"
 START_YEAR = 1970
 END_YEAR = 2026
-GENE_UNIVERSE_CSV_PATH = f"../data/genes_extracted_{umbrella_term}.csv"
+
+
+GENE_UNIVERSE_CSV_PATH = f"../../data/corpus/extracted_genes/genesUPPER_extracted_{umbrella_term}_with_freq.csv"
 GENE_COL = "gene"
 TARGET_TERMS = ("als_disease_token",)
 
@@ -39,7 +41,7 @@ USE_LAST4_AVG = True
 USE_AMP_ON_CUDA = True
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-OUTPUT_DIR = f"./features_{SELECTED_MODEL_KEY}_{umbrella_term}/"
+OUTPUT_DIR = f"../features/featuresUPPER_{SELECTED_MODEL_KEY}_{umbrella_term}/"
 # OUTPUT_FILENAME = f"features_ALS_{START_YEAR}_{END_YEAR}.pkl"
 OUTPUT_FILENAME = f"features_ALS_{SELECTED_MODEL_KEY}.pkl"
 
@@ -74,8 +76,17 @@ def resolve_model_name_and_mode() -> Tuple[str, bool]:
     return MODEL_MAP[SELECTED_MODEL_KEY], False
 
 
-def load_gene_universe_from_csv(path: str, gene_col: str = "gene") -> Set[str]:
+def load_gene_universe_from_csv(
+    path: str,
+    gene_col: str = "gene",
+    count_col: str = "count",
+    min_count: int = 1,
+) -> Set[str]:
     df = pd.read_csv(path)
+    if count_col in df.columns:
+        counts = pd.to_numeric(df[count_col], errors="coerce").fillna(0)
+        df = df[counts >= min_count]
+
     genes = (
         df[gene_col]
         .astype(str)

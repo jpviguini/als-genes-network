@@ -9,8 +9,10 @@ Pipeline (gene-centric):
 3. Build candidate genes from a local protein-coding GTF within +/-500kb.
 4. Aggregate QTL/colocalisation evidence to (gwas_cs_id, gene).
 5. Compute distance features and distScore.
-6. Attach gene embeddings.
-7. Attach ClinVar/EVA label for ALS (positive if EVA score >= 0.5).
+6. Optionally attach abundance/expression features from HPA (RNA tissue data).
+7. Attach STRING network propagation score (network_score).
+8. Attach gene embeddings.
+9. Attach ClinVar/EVA label for ALS (positive if EVA score >= 0.5).
 
 Open Targets fields used:
 - study(studyId).credibleSets rows (GWAS CS metadata + lead variant)
@@ -23,21 +25,28 @@ Features computed directly:
 - dist_score_500kb_log
 - coloc features (h4/clpp summaries, qtl/tissue counts)
 - coloc_score (thresholded from max H4)
+- HPA expression features (brain/muscle/neuron contexts, optional)
+- STRING-based network propagation score (network_score)
 - gene embeddings and has_gene_embedding
 - ClinVar/EVA score and binary label (label_positive)
 
 Features not computed directly (set to default 0 for now):
 - coding_score_sum_pip
 - coding_variant_count
-- expression_score
+- expression_score (legacy placeholder kept for backward compatibility)
 
-No interaction-network feature is implemented in this script.
+Notes:
+- This script currently supports only HPA for expression/abundance integration.
+- PaxDB integration is intentionally out-of-scope in this version.
+- Cross-source merged expression features are not created.
 """
 
 from __future__ import annotations
 
+import argparse
 import gzip
 import pickle
+import re
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -47,6 +56,11 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 import requests
+
+from string_network_propagation import (
+    load_or_build_string_gene_network_model,
+    normalize_gene_symbol as normalize_network_gene_symbol,
+)
 
 
 DEFAULT_GRAPHQL_URL = "https://api.platform.opentargets.org/api/v4/graphql"
@@ -62,7 +76,36 @@ DEFAULT_EMBEDDING_PATH = Path(
     "featuresUPPER_pubmedbert_neurodegenerative_disease/features_ALS_pubmedbert.pkl"
 )
 DEFAULT_OUT_DIR = Path("/home/viguinijpv/200.18.99.75:8000/IC/src/data/als_cs_gene_tables")
+DEFAULT_STRING_ALIASES_PATH = Path(
+    "/home/viguinijpv/200.18.99.75:8000/IC/data/9606.protein.aliases.v12.0.txt"
+)
+DEFAULT_STRING_LINKS_PATH = Path(
+    "/home/viguinijpv/200.18.99.75:8000/IC/data/9606.protein.links.v12.0.txt"
+)
+DEFAULT_STRING_CACHE_PATH = Path(
+    "/home/viguinijpv/200.18.99.75:8000/IC/src/data/als_cs_gene_tables/string_gene_network_min700.npz"
+)
 QTL_STUDY_TYPES = ["eqtl", "pqtl", "sqtl", "sceqtl", "scpqtl", "scsqtl", "tuqtl", "sctuqtl"]
+DEFAULT_HPA_EXPRESSION_THRESHOLD = 1.0
+DEFAULT_NETWORK_MIN_COMBINED_SCORE = 700.0
+DEFAULT_NETWORK_ALPHA = 0.85
+DEFAULT_NETWORK_MAX_ITER = 100
+DEFAULT_NETWORK_TOL = 1e-9
+BRAIN_CONTEXT_KEYWORDS = ("brain", "cortex", "hippoc", "cerebell", "neur")
+MUSCLE_CONTEXT_KEYWORDS = ("muscle", "myocyte", "myoblast", "myofiber", "skeletal")
+NEURON_CONTEXT_KEYWORDS = ("neuron", "neuronal", "motor neuron", "neural")
+HPA_FEATURE_COLUMNS = [
+    "hpa_brain_expression_value",
+    "hpa_muscle_expression_value",
+    "hpa_neuron_expression_value",
+    "hpa_brain_expressed_binary",
+    "hpa_muscle_expressed_binary",
+    "hpa_neuron_expressed_binary",
+    "hpa_max_relevant_expression",
+    "hpa_mean_relevant_expression",
+    "has_hpa_expression_evidence",
+    "has_expression_evidence",
+]
 
 
 @dataclass(frozen=True)
@@ -81,12 +124,137 @@ class PipelineConfig:
     timeout_sec: float = 60.0
     max_retries: int = 3
     embedding_fill_value: float = 0.0
+    hpa_path: Optional[Path] = None
+    enable_hpa: bool = True
+    hpa_expression_threshold: float = DEFAULT_HPA_EXPRESSION_THRESHOLD
+    enable_network: bool = True
+    string_aliases_path: Path = DEFAULT_STRING_ALIASES_PATH
+    string_links_path: Path = DEFAULT_STRING_LINKS_PATH
+    string_network_cache_path: Optional[Path] = DEFAULT_STRING_CACHE_PATH
+    network_min_combined_score: float = DEFAULT_NETWORK_MIN_COMBINED_SCORE
+    network_alpha: float = DEFAULT_NETWORK_ALPHA
+    network_max_iter: int = DEFAULT_NETWORK_MAX_ITER
+    network_tol: float = DEFAULT_NETWORK_TOL
+    write_hpa_mapping_report: bool = True
     write_csv: bool = True
     write_parquet: bool = True
     write_raw_coloc: bool = True
 
 
 CONFIG = PipelineConfig()
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Build locus-to-gene candidate feature table with optional HPA "
+            "expression features and future-ready network placeholders."
+        )
+    )
+    parser.add_argument("--hpa-path", type=Path, default=None, help="Optional HPA table path.")
+    parser.add_argument("--enable-hpa", action="store_true", help="Enable HPA feature extraction.")
+    parser.add_argument("--disable-hpa", action="store_true", help="Disable HPA even if --hpa-path is provided.")
+    parser.add_argument(
+        "--hpa-expression-threshold",
+        type=float,
+        default=DEFAULT_HPA_EXPRESSION_THRESHOLD,
+        help="Threshold for HPA expressed/not-expressed binary features.",
+    )
+    parser.add_argument(
+        "--no-hpa-mapping-report",
+        action="store_true",
+        help="Disable writing HPA mapping report CSV.",
+    )
+    parser.add_argument("--enable-network", action="store_true", help="Enable STRING network_score feature.")
+    parser.add_argument("--disable-network", action="store_true", help="Disable STRING network_score feature.")
+    parser.add_argument(
+        "--string-aliases-path",
+        type=Path,
+        default=DEFAULT_STRING_ALIASES_PATH,
+        help="Path to STRING aliases file (protein -> gene symbol mapping).",
+    )
+    parser.add_argument(
+        "--string-links-path",
+        type=Path,
+        default=DEFAULT_STRING_LINKS_PATH,
+        help="Path to STRING links file (protein-protein weighted edges).",
+    )
+    parser.add_argument(
+        "--string-network-cache-path",
+        type=Path,
+        default=DEFAULT_STRING_CACHE_PATH,
+        help="Optional cache .npz for prebuilt STRING gene-level transition matrix.",
+    )
+    parser.add_argument(
+        "--network-min-combined-score",
+        type=float,
+        default=DEFAULT_NETWORK_MIN_COMBINED_SCORE,
+        help="Minimum STRING combined_score edge threshold for graph construction.",
+    )
+    parser.add_argument(
+        "--network-alpha",
+        type=float,
+        default=DEFAULT_NETWORK_ALPHA,
+        help="PPR restart parameter alpha in [0, 1).",
+    )
+    parser.add_argument(
+        "--network-max-iter",
+        type=int,
+        default=DEFAULT_NETWORK_MAX_ITER,
+        help="Maximum PPR iterations.",
+    )
+    parser.add_argument(
+        "--network-tol",
+        type=float,
+        default=DEFAULT_NETWORK_TOL,
+        help="PPR convergence tolerance (L1 delta).",
+    )
+    return parser.parse_args()
+
+
+def build_config_from_args(args: argparse.Namespace, base: PipelineConfig = CONFIG) -> PipelineConfig:
+    enable_hpa = bool(base.enable_hpa)
+    if bool(args.enable_hpa):
+        enable_hpa = True
+    if bool(args.disable_hpa):
+        enable_hpa = False
+    enable_network = bool(base.enable_network)
+    if bool(args.enable_network):
+        enable_network = True
+    if bool(args.disable_network):
+        enable_network = False
+
+    return PipelineConfig(
+        study_id=base.study_id,
+        disease_id=base.disease_id,
+        datasource_id=base.datasource_id,
+        graphql_url=base.graphql_url,
+        gtf_path=base.gtf_path,
+        embedding_path=base.embedding_path,
+        out_dir=base.out_dir,
+        window_bp=base.window_bp,
+        h4_threshold=base.h4_threshold,
+        eva_positive_threshold=base.eva_positive_threshold,
+        page_size=base.page_size,
+        timeout_sec=base.timeout_sec,
+        max_retries=base.max_retries,
+        embedding_fill_value=base.embedding_fill_value,
+        hpa_path=args.hpa_path,
+        enable_hpa=enable_hpa,
+        hpa_expression_threshold=float(args.hpa_expression_threshold),
+        enable_network=enable_network,
+        string_aliases_path=Path(args.string_aliases_path),
+        string_links_path=Path(args.string_links_path),
+        string_network_cache_path=(Path(args.string_network_cache_path) if args.string_network_cache_path else None),
+        network_min_combined_score=float(args.network_min_combined_score),
+        network_alpha=float(args.network_alpha),
+        network_max_iter=int(args.network_max_iter),
+        network_tol=float(args.network_tol),
+        write_hpa_mapping_report=not bool(args.no_hpa_mapping_report),
+        write_csv=base.write_csv,
+        write_parquet=base.write_parquet,
+        write_raw_coloc=base.write_raw_coloc,
+    )
 
 
 STUDY_CREDIBLE_SETS_QUERY = """
@@ -280,6 +448,442 @@ def normalize_gene_id(gene_id: object) -> Optional[str]:
     if not s:
         return None
     return s.split(".", 1)[0]
+
+
+def _clean_colname(name: object) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(name).strip().lower())
+
+
+def _read_tabular_file(path: Path) -> pd.DataFrame:
+    suffix = path.name.lower()
+    if suffix.endswith(".tsv") or suffix.endswith(".tsv.gz") or suffix.endswith(".txt") or suffix.endswith(".txt.gz"):
+        return pd.read_csv(path, sep="\t")
+    if suffix.endswith(".csv") or suffix.endswith(".csv.gz"):
+        return pd.read_csv(path)
+    return pd.read_csv(path, sep=None, engine="python")
+
+
+def _pick_hpa_column(df: pd.DataFrame, candidates: Sequence[str]) -> Optional[str]:
+    if df.empty:
+        return None
+    col_by_clean = {_clean_colname(c): c for c in df.columns}
+    for cand in candidates:
+        col = col_by_clean.get(_clean_colname(cand))
+        if col is not None:
+            return col
+    return None
+
+
+def _match_hpa_contexts(tissue: object, cell_type: object = None) -> List[str]:
+    txt = f"{tissue or ''} {cell_type or ''}".strip().lower()
+    if not txt:
+        return []
+    contexts: List[str] = []
+    if any(k in txt for k in BRAIN_CONTEXT_KEYWORDS):
+        contexts.append("brain")
+    if any(k in txt for k in MUSCLE_CONTEXT_KEYWORDS):
+        contexts.append("muscle")
+    if any(k in txt for k in NEURON_CONTEXT_KEYWORDS):
+        contexts.append("neuron")
+    return contexts
+
+
+def load_hpa_expression_features(
+    *,
+    hpa_path: Optional[Path],
+    expression_threshold: float,
+) -> Tuple[pd.DataFrame, Dict[str, object]]:
+    empty_df = pd.DataFrame(columns=["gene_id", "gene_symbol"] + HPA_FEATURE_COLUMNS)
+    stats: Dict[str, object] = {
+        "path": str(hpa_path) if hpa_path is not None else None,
+        "status": "skipped_no_path",
+        "rows_input": 0,
+        "rows_with_relevant_context": 0,
+        "rows_missing_gene_key": 0,
+        "rows_missing_value": 0,
+        "unique_gene_rows_output": 0,
+        "has_neuron_context": False,
+        "columns": {},
+        "expression_threshold": float(expression_threshold),
+    }
+    if hpa_path is None:
+        return empty_df, stats
+    if not hpa_path.exists():
+        raise FileNotFoundError(f"HPA file not found: {hpa_path}")
+
+    raw = _read_tabular_file(hpa_path)
+    stats["rows_input"] = int(len(raw))
+    if raw.empty:
+        stats["status"] = "empty_input"
+        return empty_df, stats
+
+    gene_id_col = _pick_hpa_column(raw, ("Gene", "gene", "ensembl_gene_id", "gene_id"))
+    gene_symbol_col = _pick_hpa_column(raw, ("Gene name", "gene_name", "gene_symbol", "Gene symbol"))
+    tissue_col = _pick_hpa_column(raw, ("Tissue", "tissue"))
+    value_col = _pick_hpa_column(raw, ("nTPM", "ntpm", "TPM", "tpm", "NX", "nx"))
+    cell_type_col = _pick_hpa_column(raw, ("Cell type", "cell_type"))
+
+    stats["columns"] = {
+        "gene_id_col": gene_id_col,
+        "gene_symbol_col": gene_symbol_col,
+        "tissue_col": tissue_col,
+        "cell_type_col": cell_type_col,
+        "value_col": value_col,
+    }
+
+    required_missing: List[str] = []
+    if gene_id_col is None and gene_symbol_col is None:
+        required_missing.append("Gene/Gene name")
+    if tissue_col is None:
+        required_missing.append("Tissue")
+    if value_col is None:
+        required_missing.append("nTPM/TPM")
+    if required_missing:
+        raise ValueError(
+            f"HPA table missing required columns: {', '.join(required_missing)}. "
+            f"Found columns: {list(raw.columns)}"
+        )
+
+    value_series = pd.to_numeric(raw[value_col], errors="coerce")
+    gene_id_series = raw[gene_id_col] if gene_id_col is not None else pd.Series([None] * len(raw), index=raw.index)
+    gene_symbol_series = (
+        raw[gene_symbol_col] if gene_symbol_col is not None else pd.Series([None] * len(raw), index=raw.index)
+    )
+    tissue_series = raw[tissue_col]
+    cell_type_series = (
+        raw[cell_type_col] if cell_type_col is not None else pd.Series([""] * len(raw), index=raw.index)
+    )
+
+    signals: Dict[Tuple[Optional[str], Optional[str]], Dict[str, List[float]]] = defaultdict(
+        lambda: {"brain": [], "muscle": [], "neuron": []}
+    )
+
+    for gid_raw, gsym_raw, tissue_raw, cell_raw, value in zip(
+        gene_id_series.tolist(),
+        gene_symbol_series.tolist(),
+        tissue_series.tolist(),
+        cell_type_series.tolist(),
+        value_series.tolist(),
+    ):
+        if value is None or not np.isfinite(value):
+            stats["rows_missing_value"] += 1
+            continue
+        contexts = _match_hpa_contexts(tissue_raw, cell_raw)
+        if not contexts:
+            continue
+        gid = normalize_gene_id(gid_raw)
+        gsym = normalize_gene_symbol(gsym_raw)
+        if gid is None and gsym is None:
+            stats["rows_missing_gene_key"] += 1
+            continue
+        stats["rows_with_relevant_context"] += 1
+        key = (gid, gsym)
+        for ctx in contexts:
+            signals[key][ctx].append(float(value))
+
+    if not signals:
+        stats["status"] = "no_relevant_context_rows"
+        return empty_df, stats
+
+    out_rows: List[Dict[str, object]] = []
+    has_neuron_context = False
+    thr = float(expression_threshold)
+    for (gid, gsym), vals in signals.items():
+        brain_vals = vals["brain"]
+        muscle_vals = vals["muscle"]
+        neuron_vals = vals["neuron"]
+        brain_obs = bool(brain_vals)
+        muscle_obs = bool(muscle_vals)
+        neuron_obs = bool(neuron_vals)
+        has_neuron_context = has_neuron_context or neuron_obs
+
+        brain_value = float(max(brain_vals)) if brain_obs else 0.0
+        muscle_value = float(max(muscle_vals)) if muscle_obs else 0.0
+        neuron_value = float(max(neuron_vals)) if neuron_obs else 0.0
+
+        observed_values: List[float] = []
+        if brain_obs:
+            observed_values.append(brain_value)
+        if muscle_obs:
+            observed_values.append(muscle_value)
+        if neuron_obs:
+            observed_values.append(neuron_value)
+
+        max_relevant = float(max(observed_values)) if observed_values else 0.0
+        mean_relevant = float(np.mean(observed_values)) if observed_values else 0.0
+        has_evidence = int(bool(observed_values))
+
+        out_rows.append(
+            {
+                "gene_id": gid,
+                "gene_symbol": gsym,
+                "hpa_brain_expression_value": brain_value,
+                "hpa_muscle_expression_value": muscle_value,
+                "hpa_neuron_expression_value": neuron_value,
+                "hpa_brain_expressed_binary": int(brain_obs and brain_value >= thr),
+                "hpa_muscle_expressed_binary": int(muscle_obs and muscle_value >= thr),
+                "hpa_neuron_expressed_binary": int(neuron_obs and neuron_value >= thr),
+                "hpa_max_relevant_expression": max_relevant,
+                "hpa_mean_relevant_expression": mean_relevant,
+                "has_hpa_expression_evidence": has_evidence,
+                "has_expression_evidence": has_evidence,
+            }
+        )
+
+    out_df = pd.DataFrame(out_rows)
+    if out_df.empty:
+        stats["status"] = "no_gene_level_context_signal"
+        stats["has_neuron_context"] = False
+        return empty_df, stats
+
+    for col in HPA_FEATURE_COLUMNS:
+        if col not in out_df.columns:
+            out_df[col] = 0.0
+    out_df = out_df[["gene_id", "gene_symbol"] + HPA_FEATURE_COLUMNS]
+    out_df = out_df.drop_duplicates(subset=["gene_id", "gene_symbol"], keep="first")
+
+    stats["status"] = "ok"
+    stats["unique_gene_rows_output"] = int(len(out_df))
+    stats["has_neuron_context"] = bool(has_neuron_context)
+    return out_df, stats
+
+
+def _attach_hpa_features_by_id_symbol(
+    base_df: pd.DataFrame,
+    hpa_feature_df: pd.DataFrame,
+) -> Tuple[pd.DataFrame, Dict[str, int], pd.DataFrame]:
+    out = base_df.copy()
+    out["gene_id"] = out["gene_id"].map(normalize_gene_id)
+    out["gene_symbol"] = out["gene_symbol"].map(normalize_gene_symbol)
+    for col in HPA_FEATURE_COLUMNS:
+        if col not in out.columns:
+            out[col] = 0.0
+
+    mapping_source = pd.Series(["unmatched"] * len(out), index=out.index, dtype="object")
+    if not hpa_feature_df.empty:
+        feat = hpa_feature_df.copy()
+        feat["gene_id"] = feat["gene_id"].map(normalize_gene_id)
+        feat["gene_symbol"] = feat["gene_symbol"].map(normalize_gene_symbol)
+
+        id_feat = feat.dropna(subset=["gene_id"]).drop_duplicates(subset=["gene_id"], keep="first")
+        sym_feat = feat.dropna(subset=["gene_symbol"]).drop_duplicates(subset=["gene_symbol"], keep="first")
+
+        id_maps: Dict[str, Dict[str, float]] = {
+            col: (id_feat.set_index("gene_id")[col].to_dict() if col in id_feat.columns else {})
+            for col in HPA_FEATURE_COLUMNS
+        }
+        sym_maps: Dict[str, Dict[str, float]] = {
+            col: (sym_feat.set_index("gene_symbol")[col].to_dict() if col in sym_feat.columns else {})
+            for col in HPA_FEATURE_COLUMNS
+        }
+
+        id_keys = set(id_maps["has_hpa_expression_evidence"].keys())
+        sym_keys = set(sym_maps["has_hpa_expression_evidence"].keys())
+
+        id_matched = out["gene_id"].notna() & out["gene_id"].isin(id_keys)
+        for col in HPA_FEATURE_COLUMNS:
+            out.loc[id_matched, col] = out.loc[id_matched, "gene_id"].map(id_maps[col]).astype(float)
+        mapping_source.loc[id_matched] = "matched_by_ensembl_id"
+
+        sym_candidates = ~id_matched & out["gene_symbol"].notna()
+        sym_matched = sym_candidates & out["gene_symbol"].isin(sym_keys)
+        for col in HPA_FEATURE_COLUMNS:
+            out.loc[sym_matched, col] = out.loc[sym_matched, "gene_symbol"].map(sym_maps[col]).astype(float)
+        mapping_source.loc[sym_matched] = "matched_by_symbol_fallback"
+
+    for col in HPA_FEATURE_COLUMNS:
+        out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0.0)
+
+    int_cols = [
+        "hpa_brain_expressed_binary",
+        "hpa_muscle_expressed_binary",
+        "hpa_neuron_expressed_binary",
+        "has_hpa_expression_evidence",
+        "has_expression_evidence",
+    ]
+    for col in int_cols:
+        out[col] = out[col].astype(int)
+
+    # Backward-compatible aliases used by some downstream runs.
+    out["hpa_max_relevant_expression_value"] = out["hpa_max_relevant_expression"]
+    out["hpa_mean_relevant_expression_value"] = out["hpa_mean_relevant_expression"]
+
+    mapping_report_df = out[
+        ["gene_id", "gene_symbol", "has_hpa_expression_evidence", "has_expression_evidence"]
+    ].copy()
+    mapping_report_df["hpa_mapping_status"] = mapping_source.values
+    mapping_report_df = mapping_report_df.drop_duplicates(
+        subset=["gene_id", "gene_symbol", "hpa_mapping_status"], keep="first"
+    ).sort_values(by=["hpa_mapping_status", "gene_symbol", "gene_id"], kind="stable")
+
+    merge_stats: Dict[str, int] = {
+        "rows_matched_by_ensembl_id": int((mapping_source == "matched_by_ensembl_id").sum()),
+        "rows_matched_by_symbol_fallback": int((mapping_source == "matched_by_symbol_fallback").sum()),
+        "rows_unmatched": int((mapping_source == "unmatched").sum()),
+        "unique_genes_matched_by_ensembl_id": int(
+            mapping_report_df.loc[
+                mapping_report_df["hpa_mapping_status"] == "matched_by_ensembl_id", "gene_symbol"
+            ].nunique(dropna=True)
+        ),
+        "unique_genes_matched_by_symbol_fallback": int(
+            mapping_report_df.loc[
+                mapping_report_df["hpa_mapping_status"] == "matched_by_symbol_fallback", "gene_symbol"
+            ].nunique(dropna=True)
+        ),
+        "unique_genes_unmatched": int(
+            mapping_report_df.loc[mapping_report_df["hpa_mapping_status"] == "unmatched", "gene_symbol"].nunique(
+                dropna=True
+            )
+        ),
+    }
+    return out, merge_stats, mapping_report_df
+
+
+def attach_hpa_expression_features(
+    feature_df: pd.DataFrame,
+    *,
+    hpa_path: Optional[Path],
+    enable_hpa: bool,
+    hpa_expression_threshold: float,
+) -> Tuple[pd.DataFrame, Dict[str, object], pd.DataFrame]:
+    if feature_df.empty:
+        return feature_df, {}, pd.DataFrame(columns=["gene_id", "gene_symbol"])
+
+    out = feature_df.copy()
+    out["gene_id"] = out["gene_id"].map(normalize_gene_id)
+    out["gene_symbol"] = out["gene_symbol"].map(normalize_gene_symbol)
+
+    hpa_source_path = hpa_path if enable_hpa else None
+    hpa_feat_df, hpa_extract_stats = load_hpa_expression_features(
+        hpa_path=hpa_source_path,
+        expression_threshold=float(hpa_expression_threshold),
+    )
+    out, hpa_merge_stats, mapping_report_df = _attach_hpa_features_by_id_symbol(
+        out,
+        hpa_feat_df,
+    )
+
+    stats: Dict[str, object] = {
+        "hpa_extract": hpa_extract_stats,
+        "hpa_merge": hpa_merge_stats,
+        "rows_with_hpa_expression_evidence": int(out["has_hpa_expression_evidence"].sum()),
+        "rows_with_any_expression_evidence": int(out["has_expression_evidence"].sum()),
+        "unique_genes_without_hpa_expression_evidence": int(
+            out.loc[out["has_hpa_expression_evidence"] == 0, "gene_symbol"].nunique(dropna=True)
+        ),
+    }
+    return out, stats, mapping_report_df
+
+
+def attach_network_scores(
+    feature_df: pd.DataFrame,
+    *,
+    enable_network: bool,
+    aliases_path: Path,
+    links_path: Path,
+    cache_path: Optional[Path],
+    min_combined_score: float,
+    alpha: float,
+    max_iter: int,
+    tol: float,
+) -> Tuple[pd.DataFrame, Dict[str, object]]:
+    """
+    Attach STRING network propagation as one scalar feature per gene.
+
+    Seed strategy (first practical version):
+    - Use known positive genes (label_positive == 1) present in the table.
+    """
+    out = feature_df.copy()
+    out["network_score"] = 0.0
+    out["has_network_score"] = 0
+    out["network_prop_score"] = 0.0  # backward-compatible alias
+    out["has_network_prop_score"] = 0
+    out["network_seed_count"] = 0
+
+    stats: Dict[str, object] = {
+        "status": "disabled" if not enable_network else "pending",
+        "seed_genes_total": 0,
+        "seed_genes_mapped": 0,
+        "rows_nonzero_network_score": 0,
+        "rows_zero_network_score": int(len(out)),
+        "rows_with_network_coverage": 0,
+        "unique_genes_with_network_coverage": 0,
+        "unique_genes_nonzero_network_score": 0,
+        "cache_path": str(cache_path) if cache_path is not None else None,
+        "aliases_path": str(aliases_path),
+        "links_path": str(links_path),
+        "min_combined_score": float(min_combined_score),
+        "alpha": float(alpha),
+        "max_iter": int(max_iter),
+        "tol": float(tol),
+    }
+    if not enable_network:
+        return out, stats
+
+    if not aliases_path.exists() or not links_path.exists():
+        stats["status"] = "skipped_missing_string_files"
+        return out, stats
+
+    if "label_positive" not in out.columns:
+        stats["status"] = "skipped_missing_label_positive"
+        return out, stats
+
+    seed_genes = sorted(
+        {
+            normalize_network_gene_symbol(g)
+            for g in out.loc[pd.to_numeric(out["label_positive"], errors="coerce").fillna(0).astype(int) == 1, "gene_symbol"].tolist()
+            if normalize_network_gene_symbol(g) is not None
+        }
+    )
+    stats["seed_genes_total"] = int(len(seed_genes))
+
+    if len(seed_genes) == 0:
+        stats["status"] = "skipped_no_seed_genes"
+        return out, stats
+
+    model, model_stats = load_or_build_string_gene_network_model(
+        aliases_path=aliases_path,
+        links_path=links_path,
+        cache_path=cache_path,
+        min_combined_score=float(min_combined_score),
+    )
+    scores, ppr_stats = model.personalized_pagerank(
+        seed_genes=seed_genes,
+        alpha=float(alpha),
+        max_iter=int(max_iter),
+        tol=float(tol),
+    )
+
+    gene_norm = out["gene_symbol"].map(normalize_network_gene_symbol)
+    network_scores = model.score_genes(gene_norm.tolist(), scores, default_score=0.0)
+    out["network_score"] = (
+        pd.Series(network_scores, index=out.index).astype(float).fillna(0.0)
+    )
+    has_cov = gene_norm.isin(set(model.gene_to_idx.keys())).astype(int)
+    out["has_network_score"] = has_cov
+    out["network_prop_score"] = out["network_score"]
+    out["has_network_prop_score"] = out["has_network_score"]
+    out["network_seed_count"] = int(ppr_stats.get("seed_mapped_count", 0.0))
+
+    stats.update(model_stats)
+    stats.update(
+        {
+            "status": "ok",
+            "seed_genes_mapped": int(ppr_stats.get("seed_mapped_count", 0.0)),
+            "ppr_iterations": int(ppr_stats.get("iterations", 0.0)),
+            "ppr_converged": int(ppr_stats.get("converged", 0.0)),
+            "rows_nonzero_network_score": int((out["network_score"] > 0).sum()),
+            "rows_zero_network_score": int((out["network_score"] == 0).sum()),
+            "rows_with_network_coverage": int(out["has_network_score"].sum()),
+            "unique_genes_with_network_coverage": int(
+                gene_norm.loc[out["has_network_score"] == 1].dropna().nunique()
+            ),
+            "unique_genes_nonzero_network_score": int(
+                gene_norm.loc[out["network_score"] > 0].dropna().nunique()
+            ),
+        }
+    )
+    return out, stats
 
 
 def unique_join(values: Iterable[object], sep: str = "|", max_items: Optional[int] = None) -> str:
@@ -1357,6 +1961,12 @@ def main(config: PipelineConfig = CONFIG) -> None:
         agg_by_symbol=agg_symbol,
         h4_threshold=float(config.h4_threshold),
     )
+    final_df, hpa_stats, hpa_mapping_report_df = attach_hpa_expression_features(
+        feature_df=final_df,
+        hpa_path=config.hpa_path,
+        enable_hpa=bool(config.enable_hpa),
+        hpa_expression_threshold=float(config.hpa_expression_threshold),
+    )
 
     print(
         f"[info] Fetching ClinVar/EVA datasource scores: disease={config.disease_id} "
@@ -1372,6 +1982,17 @@ def main(config: PipelineConfig = CONFIG) -> None:
         feature_df=final_df,
         eva_df=eva_df,
         eva_threshold=float(config.eva_positive_threshold),
+    )
+    final_df, network_stats = attach_network_scores(
+        feature_df=final_df,
+        enable_network=bool(config.enable_network),
+        aliases_path=Path(config.string_aliases_path),
+        links_path=Path(config.string_links_path),
+        cache_path=(Path(config.string_network_cache_path) if config.string_network_cache_path else None),
+        min_combined_score=float(config.network_min_combined_score),
+        alpha=float(config.network_alpha),
+        max_iter=int(config.network_max_iter),
+        tol=float(config.network_tol),
     )
     print(f"[info] EVA fetch stats: {eva_fetch_stats}")
     print(
@@ -1400,6 +2021,7 @@ def main(config: PipelineConfig = CONFIG) -> None:
     raw_base = config.out_dir / f"{config.study_id}_raw_gwas_cs_gene_colocalisation"
     final_base = config.out_dir / f"{config.study_id}_cs_gene_candidate_feature_table"
     eva_base = config.out_dir / f"{config.study_id}_clinvar_eva_scores"
+    hpa_map_report_path = config.out_dir / f"{config.study_id}_hpa_mapping_report.csv"
 
     written: List[Path] = []
     if config.write_raw_coloc:
@@ -1427,11 +2049,16 @@ def main(config: PipelineConfig = CONFIG) -> None:
             write_parquet=config.write_parquet,
         )
     )
+    if bool(config.write_hpa_mapping_report):
+        hpa_mapping_report_df.to_csv(hpa_map_report_path, index=False)
+        written.append(hpa_map_report_path)
 
     print(f"[info] Embedding dimension: {emb_dim}")
     print(f"[info] Embedding load stats: {emb_stats}")
     print(f"[info] Missing embeddings (rows): {emb_attach_stats['rows_missing_embedding']}")
     print(f"[info] Missing embeddings (unique genes): {emb_attach_stats['unique_genes_missing_embedding']}")
+    print(f"[info] HPA attach stats: {hpa_stats}")
+    print(f"[info] Network attach stats: {network_stats}")
 
     for path in written:
         print(f"[info] Wrote: {path}")
@@ -1450,4 +2077,6 @@ def main(config: PipelineConfig = CONFIG) -> None:
 
 
 if __name__ == "__main__":
-    main(CONFIG)
+    cli_args = parse_args()
+    cli_config = build_config_from_args(cli_args, CONFIG)
+    main(cli_config)
