@@ -16,6 +16,10 @@ The pipeline combines:
 
 The main goal is not only to rank candidate genes within GWAS loci, but also to evaluate whether text-derived functional signals converge with GWAS evidence at the level of biological modules.
 
+<p align="center">
+  <img src="assets/diagram_pipeline.png" alt="Project pipeline overview" width="750"/>
+</p>
+
 ## Main analyses
 
 The project includes:
@@ -29,8 +33,20 @@ The project includes:
 7. GO enrichment analysis of convergent modules;
 8. module-level case study of shared and source-biased genes.
 
+<p align="center">
+  <img src="assets/convergent_modules_go_heatmap.png" alt="GO enrichment heatmap for convergent modules" width="850"/>
+</p>
+
+<p align="center">
+  <img src="assets/module_7_grouped_network_plot.png" alt="Module 7 shared and source-biased genes network" width="850"/>
+</p>
+
 ## Main idea
+
 The project started from the hypothesis that biomedical literature embeddings could improve ALS locus-to-gene prioritization. While embeddings did not consistently improve locus-level ranking, the Word2Vec embedding space showed biologically interpretable structure. In network analyses, the Word2Vec/HPA functional model showed convergence with GWAS-derived evidence at the protein-module level.
 
+The module-level analysis further suggested that literature-derived and GWAS-derived signals may highlight overlapping regions of the protein interaction network while emphasizing different genes within the same biological context.
+
 ## Notes
+
 This repository is research-oriented and under active development. Scripts were written to support exploratory analyses during the BEPE/FAPESP research internship at ETH Zürich.
