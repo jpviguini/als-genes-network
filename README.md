@@ -17,7 +17,7 @@ The pipeline combines:
 The main goal is not only to rank candidate genes within GWAS loci, but also to evaluate whether text-derived functional signals converge with GWAS evidence at the level of biological modules.
 
 <p align="center">
-  <img src="assets/diagram_pipeline.png" alt="Project pipeline overview" width="750"/>
+  <img src="assets/diagram_pipeline_updated.png" alt="Project pipeline overview" width="500"/>
 </p>
 
 ## Main analyses
@@ -34,11 +34,11 @@ The project includes:
 8. module-level case study of shared and source-biased genes.
 
 <p align="center">
-  <img src="assets/convergent_modules_go_heatmap.png" alt="GO enrichment heatmap for convergent modules" width="850"/>
+  <img src="assets/convergent_modules_go_heatmap.png" alt="GO enrichment heatmap for convergent modules" width="650"/>
 </p>
 
 <p align="center">
-  <img src="assets/module_7_grouped_network_plot.png" alt="Module 7 shared and source-biased genes network" width="850"/>
+  <img src="assets/module_7_grouped_network_plot.png" alt="Module 7 shared and source-biased genes network" width="650"/>
 </p>
 
 ## Main idea
