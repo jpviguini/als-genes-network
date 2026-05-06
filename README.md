@@ -6,13 +6,13 @@ This repository contains code developed for a research project on gene prioritiz
 
 The pipeline combines:
 
-- disease-focused PubMed corpora;
-- gene-level Word2Vec embeddings;
+- +500k PubMed articles about neurodegenerative diseases;
+- Word2Vec gene embeddings;
 - Human Protein Atlas brain and muscle expression features;
-- logistic-regression models for gene prioritization;
-- GWAS-derived evidence from ALS loci;
-- protein interaction network propagation;
-- module-level and Gene Ontology enrichment analyses.
+- Logistic Regression models for gene prioritization;
+- GWAS evidence from ALS loci;
+- Protein interaction network propagation;
+- Module-level and Gene Ontology enrichment analyses.
 
 The main goal is not only to rank candidate genes within GWAS loci, but also to evaluate whether text-derived functional signals converge with GWAS evidence at the level of biological modules.
 
@@ -31,7 +31,7 @@ The project includes:
 5. comparison between Word2Vec/HPA functional scores and GWAS-derived evidence;
 6. Personalized PageRank propagation on a protein interaction network;
 7. GO enrichment analysis of convergent modules;
-8. module-level case study of shared and source-biased genes.
+8. Case study of a convergent module.
 
 <p align="center">
   <img src="assets/convergent_modules_go_heatmap.png" alt="GO enrichment heatmap for convergent modules" width="650"/>
@@ -41,7 +41,7 @@ The project includes:
   <img src="assets/module_7_grouped_network_plot.png" alt="Module 7 shared and source-biased genes network" width="650"/>
 </p>
 
-## Main idea
+## Takeaways
 
 The project started from the hypothesis that biomedical literature embeddings could improve ALS locus-to-gene prioritization. While embeddings did not consistently improve locus-level ranking, the Word2Vec embedding space showed biologically interpretable structure. In network analyses, the Word2Vec/HPA functional model showed convergence with GWAS-derived evidence at the protein-module level.
 
@@ -49,4 +49,4 @@ The module-level analysis further suggested that literature-derived and GWAS-der
 
 ## Notes
 
-This repository is research-oriented and under active development. Scripts were written to support exploratory analyses during the BEPE/FAPESP research internship at ETH Zürich.
+Scripts were written to support exploratory analyses during the BEPE/FAPESP research internship at ETH Zürich.
